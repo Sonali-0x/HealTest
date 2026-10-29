@@ -1,0 +1,58 @@
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: ./backend
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:///./data/healtest.db
+      REDIS_URL: redis://redis:6379/0
+      HEALTEST_DATA_DIR: /app/data
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend/data:/app/data
+    depends_on:
+      - redis
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+  worker:
+    build:
+      context: .
+      dockerfile: ./worker/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: sqlite:////data/healtest.db
+      REDIS_URL: redis://redis:6379/0
+      HEALTEST_DATA_DIR: /data
+      HEALTEST_SANDBOX: local
+    volumes:
+      - ./backend/data:/data
+      - ./sample_apps:/sample_apps:ro
+    depends_on:
+      - redis
+      - api
+      - sample-apps
+
+  frontend:
+    build:
+      context: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+    depends_on:
+      - api
+
+  sample-apps:
+    image: python:3.12-slim
+    working_dir: /apps
+    volumes:
+      - ./sample_apps:/apps:ro
+    command: python -m http.server 8901
+    ports:
+      - "8901:8901"

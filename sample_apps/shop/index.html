@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Mini Shop</title>
+<style>
+  body { font-family: sans-serif; max-width: 720px; margin: 2rem auto; }
+  header { display: flex; justify-content: space-between; align-items: center; }
+  #products { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1rem; padding: 0; list-style: none; }
+  #products li { border: 1px solid #ccc; padding: 1rem; }
+  #cart-drawer { border: 2px solid #333; padding: 1rem; margin-top: 1rem; display: none; }
+  #cart-drawer.open { display: block; }
+  #cart-items { list-style: none; padding: 0; }
+  #order-confirmation { display: none; border: 2px solid green; padding: 1rem; margin-top: 1rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Mini Shop</h1>
+  <button id="cart-btn">Cart (<span id="cart-count">0</span>)</button>
+</header>
+<ul id="products">
+  <li data-id="p1">
+    <h3 class="product-name">Red Widget</h3>
+    <p class="product-price" data-price="10.00">$10.00</p>
+    <button class="add-to-cart">Add to cart</button>
+  </li>
+  <li data-id="p2">
+    <h3 class="product-name">Blue Widget</h3>
+    <p class="product-price" data-price="20.00">$20.00</p>
+    <button class="add-to-cart">Add to cart</button>
+  </li>
+  <li data-id="p3">
+    <h3 class="product-name">Green Widget</h3>
+    <p class="product-price" data-price="5.50">$5.50</p>
+    <button class="add-to-cart">Add to cart</button>
+  </li>
+</ul>
+<aside id="cart-drawer" aria-label="cart">
+  <h2>Your cart</h2>
+  <p id="empty-cart">Your cart is empty.</p>
+  <ul id="cart-items"></ul>
+  <p>Total: <span id="cart-total">$0.00</span></p>
+  <button id="checkout-btn">Checkout</button>
+  <form id="checkout-form" style="display:none">
+    <h3>Checkout</h3>
+    <input id="buyer-name" placeholder="Name">
+    <input id="buyer-email" placeholder="Email">
+    <input id="buyer-address" placeholder="Address">
+    <button id="place-order" type="submit">Place order</button>
+  </form>
+</aside>
+<div id="order-confirmation">Order placed! Thank you.</div>
+<script>
+(function () {
+  var KEY = "healtest-cart";
+  var cart = JSON.parse(localStorage.getItem(KEY) || "{}");
+  var drawer = document.getElementById("cart-drawer");
+
+  function prices() {
+    var out = {};
+    document.querySelectorAll("#products li").forEach(function (li) {
+      out[li.dataset.id] = {
+        name: li.querySelector(".product-name").textContent,
+        price: parseFloat(li.querySelector(".product-price").dataset.price)
+      };
+    });
+    return out;
+  }
+
+  function money(n) { return "$" + n.toFixed(2); }
+
+  function save() { localStorage.setItem(KEY, JSON.stringify(cart)); }
+
+  function render() {
+    var info = prices();
+    var count = 0, total = 0;
+    var ul = document.getElementById("cart-items");
+    ul.innerHTML = "";
+    Object.keys(cart).forEach(function (id) {
+      var qty = cart[id];
+      if (qty <= 0) return;
+      count += qty;
+      total += info[id].price * qty;
+      var li = document.createElement("li");
+      li.dataset.id = id;
+      li.innerHTML = '<span class="item-name"></span> ' +
+        '<button class="qty-dec">-</button>' +
+        '<span class="item-qty"></span>' +
+        '<button class="qty-inc">+</button> ' +
+        '<button class="remove-item">Remove</button>';
+      li.querySelector(".item-name").textContent = info[id].name;
+      li.querySelector(".item-qty").textContent = qty;
+      ul.appendChild(li);
+    });
+    document.getElementById("cart-count").textContent = count;
+    document.getElementById("cart-total").textContent = money(total);
+    document.getElementById("empty-cart").style.display = count ? "none" : "block";
+  }
+
+  document.getElementById("products").addEventListener("click", function (e) {
+    if (!e.target.classList.contains("add-to-cart")) return;
+    var id = e.target.closest("li").dataset.id;
+    cart[id] = (cart[id] || 0) + 1;
+    save();
+    render();
+  });
+
+  document.getElementById("cart-btn").addEventListener("click", function () {
+    drawer.classList.toggle("open");
+  });
+
+  document.getElementById("cart-items").addEventListener("click", function (e) {
+    var li = e.target.closest("li");
+    if (!li) return;
+    var id = li.dataset.id;
+    if (e.target.classList.contains("qty-inc")) cart[id]++;
+    else if (e.target.classList.contains("qty-dec")) cart[id]--;
+    else if (e.target.classList.contains("remove-item")) delete cart[id];
+    else return;
+    if (cart[id] <= 0) delete cart[id];
+    save();
+    render();
+  });
+
+  document.getElementById("checkout-btn").addEventListener("click", function () {
+    document.getElementById("checkout-form").style.display = "block";
+  });
+
+  document.getElementById("checkout-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    cart = {};
+    save();
+    render();
+    drawer.classList.remove("open");
+    document.getElementById("checkout-form").style.display = "none";
+    document.getElementById("order-confirmation").style.display = "block";
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>

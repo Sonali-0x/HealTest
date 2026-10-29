@@ -1,0 +1,5 @@
+pytest>=8.0
+selenium>=4.0
+rq>=1.16
+redis>=5.0
+httpx>=0.27

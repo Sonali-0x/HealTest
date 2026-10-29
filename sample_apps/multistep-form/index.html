@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Signup Form</title>
+<style>
+  body { font-family: sans-serif; max-width: 480px; margin: 2rem auto; }
+  .step { display: none; }
+  .step.current { display: block; }
+  .error { color: red; min-height: 1.2em; display: block; }
+  #progress { list-style: none; padding: 0; display: flex; gap: 1rem; }
+  #progress li.done { color: green; }
+  #progress li.current { font-weight: bold; }
+  #success-message { display: none; border: 2px solid green; padding: 1rem; }
+</style>
+</head>
+<body>
+<h1>Signup</h1>
+<ol id="progress">
+  <li data-step="1" class="current">Personal</li>
+  <li data-step="2">Address</li>
+  <li data-step="3">Review</li>
+</ol>
+
+<section id="step-1" class="step current">
+  <h2>Step 1: Personal</h2>
+  <input id="first-name" placeholder="First name">
+  <input id="last-name" placeholder="Last name">
+  <input id="email" placeholder="Email">
+  <span class="error" id="error-1"></span>
+  <button id="next-1">Next</button>
+</section>
+
+<section id="step-2" class="step">
+  <h2>Step 2: Address</h2>
+  <input id="street" placeholder="Street">
+  <input id="city" placeholder="City">
+  <select id="country">
+    <option value="">Select country</option>
+    <option value="US">United States</option>
+    <option value="IN">India</option>
+  </select>
+  <span class="error" id="error-2"></span>
+  <button id="back-2">Back</button>
+  <button id="next-2">Next</button>
+</section>
+
+<section id="step-3" class="step">
+  <h2>Step 3: Review</h2>
+  <div id="review-summary"></div>
+  <button id="back-3">Back</button>
+  <button id="submit-btn">Submit</button>
+</section>
+
+<div id="success-message">Signup complete!</div>
+
+<script>
+(function () {
+  var current = 1;
+
+  function show(n) {
+    current = n;
+    [1, 2, 3].forEach(function (i) {
+      document.getElementById("step-" + i).classList.toggle("current", i === n);
+    });
+    document.querySelectorAll("#progress li").forEach(function (li) {
+      var s = Number(li.dataset.step);
+      li.classList.toggle("current", s === n);
+      li.classList.toggle("done", s < n);
+    });
+    if (n === 3) {
+      var v = function (id) { return document.getElementById(id).value; };
+      document.getElementById("review-summary").textContent =
+        v("first-name") + " " + v("last-name") + ", " + v("email") + ", " +
+        v("street") + ", " + v("city") + ", " + v("country");
+    }
+  }
+
+  document.getElementById("next-1").addEventListener("click", function () {
+    var f = document.getElementById("first-name").value.trim();
+    var l = document.getElementById("last-name").value.trim();
+    var e = document.getElementById("email").value.trim();
+    var err = document.getElementById("error-1");
+    if (!f || !l || !e) { err.textContent = "All fields are required."; return; }
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e)) { err.textContent = "Invalid email."; return; }
+    err.textContent = "";
+    show(2);
+  });
+
+  document.getElementById("back-2").addEventListener("click", function () { show(1); });
+  document.getElementById("back-3").addEventListener("click", function () { show(2); });
+
+  document.getElementById("next-2").addEventListener("click", function () {
+    var s = document.getElementById("street").value.trim();
+    var c = document.getElementById("city").value.trim();
+    var co = document.getElementById("country").value;
+    var err = document.getElementById("error-2");
+    if (!s || !c || !co) { err.textContent = "All fields are required."; return; }
+    err.textContent = "";
+    show(3);
+  });
+
+  document.getElementById("submit-btn").addEventListener("click", function () {
+    document.getElementById("step-3").classList.remove("current");
+    document.getElementById("success-message").style.display = "block";
+  });
+})();
+</script>
+</body>
+</html>

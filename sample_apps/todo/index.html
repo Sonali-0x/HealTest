@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Todo App</title>
+<style>
+  body { font-family: sans-serif; max-width: 480px; margin: 2rem auto; }
+  #todo-list { list-style: none; padding: 0; }
+  #todo-list li { display: flex; gap: 0.5rem; align-items: center; padding: 0.25rem 0; }
+  #todo-list li.completed .todo-text { text-decoration: line-through; color: #888; }
+  #todo-list li.hidden { display: none; }
+  .filters button.active { font-weight: bold; }
+</style>
+</head>
+<body>
+<h1>Todos</h1>
+<input id="new-todo" type="text" placeholder="What needs to be done?">
+<button id="add-btn">Add</button>
+<p id="empty-state">No todos yet.</p>
+<ul id="todo-list"></ul>
+<div>
+  <span id="todo-count">0 items left</span>
+  <span class="filters">
+    <button data-filter="all" class="active">All</button>
+    <button data-filter="active">Active</button>
+    <button data-filter="completed">Completed</button>
+  </span>
+  <button id="clear-completed">Clear completed</button>
+</div>
+<script>
+(function () {
+  var KEY = "healtest-todos";
+  var todos = JSON.parse(localStorage.getItem(KEY) || "[]");
+  var filter = "all";
+  var list = document.getElementById("todo-list");
+  var emptyState = document.getElementById("empty-state");
+
+  function save() { localStorage.setItem(KEY, JSON.stringify(todos)); }
+
+  function render() {
+    list.innerHTML = "";
+    var visible = 0;
+    todos.forEach(function (t, i) {
+      if (filter === "active" && t.done) return;
+      if (filter === "completed" && !t.done) return;
+      visible++;
+      var li = document.createElement("li");
+      if (t.done) li.className = "completed";
+      li.dataset.index = i;
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "todo-toggle";
+      box.checked = t.done;
+      box.setAttribute("aria-label", "toggle " + t.text);
+      var span = document.createElement("span");
+      span.className = "todo-text";
+      span.textContent = t.text;
+      var del = document.createElement("button");
+      del.className = "todo-delete";
+      del.textContent = "Delete";
+      del.setAttribute("aria-label", "delete " + t.text);
+      li.appendChild(box);
+      li.appendChild(span);
+      li.appendChild(del);
+      list.appendChild(li);
+    });
+    var left = todos.filter(function (t) { return !t.done; }).length;
+    document.getElementById("todo-count").textContent = left + " items left";
+    emptyState.style.display = todos.length ? "none" : "block";
+    document.querySelectorAll(".filters button").forEach(function (b) {
+      b.classList.toggle("active", b.dataset.filter === filter);
+    });
+  }
+
+  document.getElementById("add-btn").addEventListener("click", function () {
+    var input = document.getElementById("new-todo");
+    var text = input.value.trim();
+    if (!text) return;
+    todos.push({ text: text, done: false });
+    input.value = "";
+    save();
+    render();
+  });
+
+  list.addEventListener("change", function (e) {
+    if (!e.target.classList.contains("todo-toggle")) return;
+    var i = Number(e.target.closest("li").dataset.index);
+    todos[i].done = e.target.checked;
+    save();
+    render();
+  });
+
+  list.addEventListener("click", function (e) {
+    if (!e.target.classList.contains("todo-delete")) return;
+    var i = Number(e.target.closest("li").dataset.index);
+    todos.splice(i, 1);
+    save();
+    render();
+  });
+
+  document.querySelectorAll(".filters button").forEach(function (b) {
+    b.addEventListener("click", function () {
+      filter = b.dataset.filter;
+      render();
+    });
+  });
+
+  document.getElementById("clear-completed").addEventListener("click", function () {
+    todos = todos.filter(function (t) { return !t.done; });
+    save();
+    render();
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
