@@ -29,9 +29,11 @@ import traceback
 
 import pytest
 
+from app.evidence import extract_locator_hint, parse_failing_location, trim_dom
+
 ARTIFACT_ENV = "HEALTEST_ARTIFACT_DIR"
 REPORT_ENV = "HEALTEST_REPORT_LOG"
-MAX_DOM_CHARS = 500_000
+MAX_ERROR_CHARS = 20_000
 MAX_CONSOLE_ENTRIES = 500
 MAX_ELEMENTS = 300
 
@@ -47,6 +49,8 @@ return Array.from(document.querySelectorAll(
     text: (el.innerText || el.value || '').slice(0, 80),
     x: Math.round(r.x), y: Math.round(r.y),
     w: Math.round(r.width), h: Math.round(r.height),
+    viewport_width: window.innerWidth,
+    viewport_height: window.innerHeight,
     visible: r.width > 0 && r.height > 0
   };
 });
@@ -113,67 +117,80 @@ def _elements(driver) -> list:
         return []
 
 
-def _failing_line(longrepr_text: str) -> str:
-    matches = re.findall(
-        r"^(?:File \"([^\"]+\.py)\", line (\d+)|([^\s:]+\.py:\d+))", longrepr_text or "", re.M
-    )
-    flat = [m[2] if m[2] else f"{m[0]}:{m[1]}" for m in matches]
-    # Prefer frames inside test files; fall back to the last frame found.
-    for loc in reversed(flat):
-        norm = loc.replace("\\", "/")
-        if "/tests/" in norm or os.path.basename(norm).startswith("test_"):
-            return loc
-    return flat[-1] if flat else ""
-
-
 def _capture(item, longrepr_text: str) -> str | None:
     driver = _driver_for(item)
-    if driver is None:
-        return None
     outdir = os.path.join(_artifact_root(), _safe_name(item.nodeid))
     os.makedirs(outdir, exist_ok=True)
     files: dict[str, str | None] = {
-        "screenshot": None, "dom": None, "console": None, "elements": None,
+        "screenshot": None,
+        "dom": None,
+        "console": None,
+        "elements": None,
+        "error_trace": "error_trace.txt",
+        "failing_location": "failing_location.txt",
+        "page_url": "page_url.txt",
     }
-    truncated: dict[str, bool] = {}
+    capture_errors: list[str] = []
+    with open(os.path.join(outdir, "error_trace.txt"), "w", encoding="utf-8") as fh:
+        fh.write(longrepr_text[:MAX_ERROR_CHARS])
+    failing_file, failing_line = parse_failing_location(longrepr_text)
+    failing_location = f"{failing_file}:{failing_line}" if failing_file else ""
+    if not failing_location:
+        capture_errors.append("could not identify failing test location")
+    with open(os.path.join(outdir, "failing_location.txt"), "w", encoding="utf-8") as fh:
+        fh.write(failing_location)
 
-    png = _screenshot_png(driver)
-    if png:
-        with open(os.path.join(outdir, "screenshot.png"), "wb") as fh:
-            fh.write(png)
-        files["screenshot"] = "screenshot.png"
+    url = ""
+    if driver is None:
+        capture_errors.append("Selenium WebDriver was unavailable")
+    else:
+        png = _screenshot_png(driver)
+        if png:
+            with open(os.path.join(outdir, "screenshot.png"), "wb") as fh:
+                fh.write(png)
+            files["screenshot"] = "screenshot.png"
+        else:
+            capture_errors.append("Could not capture screenshot")
 
-    try:
-        dom = driver.page_source or ""
-    except Exception:
-        dom = ""
-    truncated["dom"] = len(dom) > MAX_DOM_CHARS
-    with open(os.path.join(outdir, "dom.html"), "w", encoding="utf-8") as fh:
-        fh.write(dom[:MAX_DOM_CHARS])
-    files["dom"] = "dom.html"
+        try:
+            dom = driver.page_source or ""
+        except Exception as exc:
+            dom = ""
+            capture_errors.append(f"Could not capture DOM: {exc}")
+        locator_hint = extract_locator_hint(longrepr_text)
+        trimmed_dom = trim_dom(dom, focus=locator_hint)
+        with open(os.path.join(outdir, "dom.html"), "w", encoding="utf-8") as fh:
+            fh.write(trimmed_dom)
+        files["dom"] = "dom.html"
 
-    console = _console_text(driver)
-    with open(os.path.join(outdir, "console.log"), "w", encoding="utf-8") as fh:
-        fh.write(console)
-    files["console"] = "console.log"
+        console = _console_text(driver)
+        with open(os.path.join(outdir, "console.log"), "w", encoding="utf-8") as fh:
+            fh.write(console)
+        files["console"] = "console.log"
 
-    with open(os.path.join(outdir, "elements.json"), "w", encoding="utf-8") as fh:
-        json.dump(_elements(driver), fh)
-    files["elements"] = "elements.json"
+        with open(os.path.join(outdir, "elements.json"), "w", encoding="utf-8") as fh:
+            json.dump(_elements(driver), fh)
+        files["elements"] = "elements.json"
 
-    try:
-        url = driver.current_url
-    except Exception:
-        url = ""
+        try:
+            url = driver.current_url
+        except Exception as exc:
+            capture_errors.append(f"Could not capture page URL: {exc}")
+        if not url:
+            capture_errors.append("page URL was empty")
+
+    with open(os.path.join(outdir, "page_url.txt"), "w", encoding="utf-8") as fh:
+        fh.write(url)
 
     manifest = {
         "test_name": item.nodeid,
         "url": url,
-        "failing_line": _failing_line(longrepr_text),
+        "failing_line": failing_location,
         "error_head": longrepr_text[:2000],
         "files": files,
-        "truncated": truncated,
+        "capture_errors": capture_errors,
     }
+    files["manifest"] = "manifest.json"
     with open(os.path.join(outdir, "manifest.json"), "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
     return outdir

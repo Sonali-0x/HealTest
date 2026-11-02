@@ -8,6 +8,7 @@ FROM python:3.12-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
     chromium-driver \
+    docker-cli \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv
@@ -16,6 +17,7 @@ COPY worker/requirements.txt ./worker-requirements.txt
 RUN pip install --no-cache-dir -r backend-requirements.txt -r worker-requirements.txt
 
 COPY backend/app ./app
+COPY benchmark ./benchmark
 COPY worker/conftest_plugin.py ./
 COPY worker/runner.py ./
 

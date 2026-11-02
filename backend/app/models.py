@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 
 
@@ -36,6 +36,7 @@ class Run(Base):
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     total_tests: Mapped[int] = mapped_column(Integer, default=0)
     failed_tests: Mapped[int] = mapped_column(Integer, default=0)
+    flaky_tests: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
 
 
@@ -47,6 +48,7 @@ class TestResult(Base):
     status: Mapped[str] = mapped_column(String(50), default="failed")
     error_text: Mapped[str] = mapped_column(Text, default="")
     final_state: Mapped[str] = mapped_column(String(50), default="pending")
+    flaky: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class Attempt(Base):
@@ -78,6 +80,7 @@ class Patch(Base):
     diff: Mapped[str] = mapped_column(Text, default="")
     rationale: Mapped[str] = mapped_column(String(1000), default="")
     status: Mapped[str] = mapped_column(String(50), default="proposed")
+    approved_copy_path: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
 
 
@@ -85,7 +88,12 @@ class Benchmark(Base):
     __tablename__ = "benchmarks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    status: Mapped[str] = mapped_column(String(50), default="queued")
+    seed: Mapped[int] = mapped_column(Integer, default=42)
     config: Mapped[str] = mapped_column(Text, default="{}")
+    report_json: Mapped[str] = mapped_column(Text, default="{}")
+    error: Mapped[str] = mapped_column(Text, default="")
     heal_rate: Mapped[float] = mapped_column(Float, default=0.0)
     avg_attempts: Mapped[float] = mapped_column(Float, default=0.0)
     median_seconds: Mapped[float] = mapped_column(Float, default=0.0)
@@ -98,9 +106,14 @@ class BenchmarkCase(Base):
     benchmark_id: Mapped[int] = mapped_column(ForeignKey("benchmarks.id"))
     app: Mapped[str] = mapped_column(String(100))
     mutation_type: Mapped[str] = mapped_column(String(100))
+    arm: Mapped[str] = mapped_column(String(50), default="healtest")
     healed: Mapped[int] = mapped_column(Integer, default=0)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     seconds: Mapped[float] = mapped_column(Float, default=0.0)
+    tokens: Mapped[int] = mapped_column(Integer, default=0)
+    unsafe_fixes: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    run_id: Mapped[int | None] = mapped_column(ForeignKey("runs.id"), nullable=True)
 
 
 def get_engine(url: str | None = None):
@@ -120,6 +133,40 @@ SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 def init_db(url: str | None = None):
     eng = get_engine(url) if url else engine
     Base.metadata.create_all(bind=eng)
+    additions = {
+        "patches": {
+            "approved_copy_path": "VARCHAR(1000)",
+        },
+        "runs": {
+            "flaky_tests": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "test_results": {
+            "flaky": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "benchmarks": {
+            "finished_at": "DATETIME",
+            "status": "VARCHAR(50) NOT NULL DEFAULT 'queued'",
+            "seed": "INTEGER NOT NULL DEFAULT 42",
+            "report_json": "TEXT NOT NULL DEFAULT '{}'",
+            "error": "TEXT NOT NULL DEFAULT ''",
+        },
+        "benchmark_cases": {
+            "arm": "VARCHAR(50) NOT NULL DEFAULT 'healtest'",
+            "tokens": "INTEGER NOT NULL DEFAULT 0",
+            "unsafe_fixes": "INTEGER NOT NULL DEFAULT 0",
+            "error": "TEXT NOT NULL DEFAULT ''",
+            "run_id": "INTEGER",
+        },
+    }
+    with eng.begin() as connection:
+        inspector = inspect(eng)
+        for table, columns in additions.items():
+            existing = {column["name"] for column in inspector.get_columns(table)}
+            for name, declaration in columns.items():
+                if name not in existing:
+                    connection.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
+                    )
     return eng
 
 

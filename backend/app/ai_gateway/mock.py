@@ -1,11 +1,8 @@
-"""Mock model for offline dev and CI (PRD risk mitigation).
-
-Returns a fixed, valid diagnosis + diff so the loop, safety checks,
-dashboard and benchmark harness work without model access.
-"""
+"""Mock model for offline development and CI."""
 
 from __future__ import annotations
 
+from .. import patcher
 from .schemas import Diagnosis, Fix
 
 MOCK_DIAGNOSIS = Diagnosis(
@@ -16,23 +13,23 @@ MOCK_DIAGNOSIS = Diagnosis(
     needs_visual=False,
 )
 
-MOCK_FIX = Fix(
-    diff=(
-        "--- a/tests/test_form.py\n"
-        "+++ b/tests/test_form.py\n"
-        "@@ -10,1 +10,1 @@\n"
-        '-    driver.find_element(By.ID, "submit").click()\n'
-        '+    driver.find_element(By.ID, "submit-btn").click()\n'
-    ),
-    rationale="Mock: update renamed locator.",
-)
-
-
 def mock_diagnose(error: str = "", dom_excerpt: str = "", prior: str = "") -> Diagnosis:
     _ = (error, dom_excerpt, prior)
     return MOCK_DIAGNOSIS.model_copy()
 
 
-def mock_fix(test_code: str = "", diagnosis: str = "", element: str = "") -> Fix:
-    _ = (test_code, diagnosis, element)
-    return MOCK_FIX.model_copy()
+def mock_fix(
+    test_code: str = "",
+    diagnosis: str = "",
+    element: str = "",
+    test_file: str = "tests/test_x.py",
+    prior: str = "",
+) -> Fix:
+    _ = (diagnosis, element, prior)
+    if 'By.ID, "submit"' not in test_code:
+        return Fix(diff="", rationale="Mock could not identify a supported locator to update.")
+    updated = test_code.replace('By.ID, "submit"', 'By.ID, "submit-btn"', 1)
+    return Fix(
+        diff=patcher.build_diff(test_file, test_code, updated),
+        rationale="Mock: update the renamed submit-button locator.",
+    )

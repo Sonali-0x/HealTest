@@ -12,10 +12,19 @@ def trim_dom(html: str, focus: str = "") -> str:
     """Strip scripts/styles and cap size; keep region around focus when given."""
     text = re.sub(r"(?is)<script.*?</script>", "", html)
     text = re.sub(r"(?is)<style.*?</style>", "", text)
-    if focus and focus in text:
-        idx = text.index(focus)
-        start = max(0, idx - MAX_DOM_CHARS // 2)
-        return text[start : start + MAX_DOM_CHARS]
+    focus_values = [focus] if focus else []
+    id_match = re.search(r"By\.ID,\s*[\"']([^\"']+)", focus)
+    if id_match:
+        focus_values.extend((f'id="{id_match.group(1)}"', f"id='{id_match.group(1)}'"))
+    if focus.startswith("#"):
+        focus_values.extend((f'id="{focus[1:]}"', f"id='{focus[1:]}'"))
+    elif focus.startswith("."):
+        focus_values.append(focus[1:])
+    for value in focus_values:
+        if value and value in text:
+            idx = text.index(value)
+            start = max(0, idx - MAX_DOM_CHARS // 2)
+            return text[start : start + MAX_DOM_CHARS]
     return text[:MAX_DOM_CHARS]
 
 
@@ -28,6 +37,8 @@ def failing_step(error_text: str) -> str:
 
 
 _LOCATION_RES = (
+    # pytest on Windows: C:\path\tests\test_x.py:12: in test_name
+    re.compile(r"(?m)^((?:[A-Za-z]:)?[^\r\n]*?\.py):(\d+):"),
     # pytest short summary: tests/test_x.py:12: NoSuchElementException
     re.compile(r"(?m)^([^\s:]+\.py):(\d+):"),
     # cpython traceback: File "/path/test_x.py", line 12, in test_y

@@ -17,5 +17,6 @@ cd sample_apps/todo/tests
 APP_URL=http://localhost:8901 pytest -q
 ```
 
-Element IDs are stable on purpose: the Phase 6 benchmark mutates them to
-produce realistic breakages (renamed id, moved element, new overlay, ...).
+Element IDs are stable on purpose: the Phase 6 benchmark mutates isolated
+copies of these pages with renamed IDs, changed labels, movement/wrappers,
+overlays, extra steps, and button-to-link changes.

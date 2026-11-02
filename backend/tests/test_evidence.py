@@ -21,6 +21,13 @@ def test_trim_dom_focus_window():
     assert len(out) == evidence.MAX_DOM_CHARS
 
 
+def test_trim_dom_finds_selector_in_markup():
+    html = "<p>" + "a" * 20_000 + '<button id="submit">Submit</button>' + "b" * 20_000
+    out = evidence.trim_dom(html, focus="#submit")
+    assert '<button id="submit">' in out
+    assert len(out) == evidence.MAX_DOM_CHARS
+
+
 def test_failing_step():
     tb = 'test_x.py:12: in test_y\nE   NoSuchElementException: #submit\nE   extra line'
     assert evidence.failing_step(tb) == "NoSuchElementException: #submit"
@@ -35,6 +42,19 @@ def test_parse_failing_location_pytest_format():
 def test_parse_failing_location_cpython_format():
     tb = '  File "/app/tests/test_shop.py", line 17, in test_add\n    assert x'
     assert evidence.parse_failing_location(tb) == ("/app/tests/test_shop.py", "17")
+
+
+def test_parse_failing_location_prefers_windows_test_path_over_library_frames():
+    tb = (
+        "C:\\Users\\Sonali\\AppData\\Local\\Temp\\healtest\\tests\\test_form.py:3: "
+        "in test_submit\n"
+        "  File \".venv\\Lib\\site-packages\\selenium\\webdriver\\remote\\errorhandler.py\", "
+        "line 234, in check_response\n"
+    )
+    assert evidence.parse_failing_location(tb) == (
+        "C:\\Users\\Sonali\\AppData\\Local\\Temp\\healtest\\tests\\test_form.py",
+        "3",
+    )
 
 
 def test_parse_failing_location_prefers_test_frame():

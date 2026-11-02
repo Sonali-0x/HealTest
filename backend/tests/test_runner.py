@@ -1,4 +1,6 @@
+import io
 import json
+import tarfile
 
 import pytest
 
@@ -96,7 +98,150 @@ def test_resolve_mode_explicit(monkeypatch):
         runner.resolve_mode()
 
 
+def test_run_tests_validates_target_is_inside_suite(tmp_path):
+    suite = tmp_path / "tests"
+    suite.mkdir()
+    (suite / "test_ok.py").write_text("def test_ok(): pass\n")
+    (tmp_path / "outside.py").write_text("def test_outside(): pass\n")
+
+    with pytest.raises(runner.RunnerUnavailable, match="inside the test directory"):
+        runner.run_tests(str(suite), "http://localhost", test_target="../outside.py")
+
+
+def test_run_tests_runs_only_the_requested_test_file(tmp_path, monkeypatch):
+    suite = tmp_path / "tests"
+    suite.mkdir()
+    target = suite / "test_ok.py"
+    target.write_text("def test_ok(): pass\n")
+    captured = {}
+
+    def fake_run_local(test_dir, app_url, artifact_dir, report_log, timeout_s, summary, test_target=None):
+        captured.update(test_dir=test_dir, test_target=test_target)
+
+    monkeypatch.setattr(runner, "resolve_mode", lambda: "local")
+    monkeypatch.setattr(runner, "_run_local", fake_run_local)
+    monkeypatch.setattr(runner, "parse_report_log", lambda path: (1, 1, []))
+
+    result = runner.run_tests(str(suite), "http://localhost", test_target="test_ok.py")
+
+    assert result.total == 1
+    assert captured["test_dir"] == str(suite)
+    assert captured["test_target"] == "test_ok.py"
+
+
 def test_plugin_dir_from_env(tmp_path, monkeypatch):
     (tmp_path / "conftest_plugin.py").write_text("# stub")
     monkeypatch.setenv("HEALTEST_WORKER_DIR", str(tmp_path))
     assert runner.plugin_dir() == str(tmp_path)
+
+
+def test_docker_target_requires_explicit_host_allowlist(monkeypatch):
+    monkeypatch.setenv("HEALTEST_SANDBOX_ALLOWED_HOSTS", "sample-apps, internal-app")
+    runner._validate_sandbox_target("http://sample-apps:8901/todo/")
+    with pytest.raises(runner.RunnerUnavailable, match="ALLOWED_HOSTS"):
+        runner._validate_sandbox_target("http://other.example/")
+
+
+def test_docker_runner_uses_ephemeral_isolated_container(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_docker_run(args, timeout_s=None, input_data=None):
+        calls.append((args, timeout_s, input_data))
+        output = "0\n" if args[0] == "exec" and "pytest" in args else ""
+        return runner.subprocess.CompletedProcess(args, 0, stdout=output, stderr="")
+
+    def fake_docker_run_bytes(args, timeout_s=None):
+        calls.append((args, timeout_s, None))
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w"):
+            pass
+        return runner.subprocess.CompletedProcess(
+            args, 0, stdout=archive.getvalue(), stderr=b""
+        )
+
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runner, "_docker_run", fake_docker_run)
+    monkeypatch.setattr(runner, "_docker_run_bytes", fake_docker_run_bytes)
+    monkeypatch.setenv("HEALTEST_SANDBOX_ALLOWED_HOSTS", "sample-apps")
+    monkeypatch.setenv("HEALTEST_SANDBOX_NETWORK", "healtest-sandbox")
+    monkeypatch.setenv("HEALTEST_SANDBOX_CPUS", "1.5")
+    monkeypatch.setenv("HEALTEST_SANDBOX_MEMORY", "768m")
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_sample.py").write_text("def test_sample(): pass\n")
+    artifacts = tmp_path / "artifacts"
+    artifacts.mkdir()
+    summary = runner.RunSummary()
+
+    runner._run_docker(
+        str(tests), "http://sample-apps:8901/todo/", str(artifacts),
+        30, summary,
+    )
+
+    create_args = calls[0][0]
+    assert create_args[0] == "create"
+    assert "--read-only" in create_args
+    assert "--cap-drop=ALL" in create_args
+    assert "--cpus=1.5" in create_args
+    assert "--memory=768m" in create_args
+    assert "--network=healtest-sandbox" in create_args
+    assert not any(arg == "-v" for arg in create_args)
+    assert create_args[-2:] == ["sleep", "infinity"]
+    assert [call[0][0] for call in calls] == [
+        "create", "start", "exec", "exec", "exec", "exec", "rm"
+    ]
+    assert calls[3][0][1] == "-i"
+    assert calls[3][2]
+    with tarfile.open(fileobj=io.BytesIO(calls[3][2]), mode="r:") as archive:
+        assert archive.getnames() == ["test_sample.py"]
+    assert calls[4][1] == 30
+    assert calls[5][0][1] == calls[0][0][2]
+    assert "followlinks=False" in calls[5][0][-1]
+    assert summary.errors == []
+    assert not summary.timed_out
+
+
+def test_docker_runner_rejects_non_allowlisted_target(tmp_path, monkeypatch):
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setenv("HEALTEST_SANDBOX_ALLOWED_HOSTS", "sample-apps")
+    with pytest.raises(runner.RunnerUnavailable, match="ALLOWED_HOSTS"):
+        runner._run_docker(
+            str(tmp_path), "http://external.example/", str(tmp_path), 30,
+            runner.RunSummary(),
+        )
+
+
+def test_docker_runner_kills_timed_out_container(tmp_path, monkeypatch):
+    calls = []
+
+    def fake_docker_run(args, timeout_s=None, input_data=None):
+        calls.append(args[0])
+        if args[0] == "exec" and "pytest" in args:
+            raise runner.subprocess.TimeoutExpired(["docker", *args], timeout_s)
+        return runner.subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/docker")
+    monkeypatch.setattr(runner, "_docker_run", fake_docker_run)
+    monkeypatch.setenv("HEALTEST_SANDBOX_ALLOWED_HOSTS", "sample-apps")
+    summary = runner.RunSummary()
+
+    runner._run_docker(
+        str(tmp_path), "http://sample-apps:8901/", str(tmp_path), 2, summary
+    )
+
+    assert summary.timed_out
+    assert summary.errors == ["sandbox exceeded wall-clock limit of 2s"]
+    assert calls == ["create", "start", "exec", "exec", "exec", "kill", "rm"]
+
+
+def test_extract_artifact_archive_rejects_parent_paths(tmp_path):
+    archive = io.BytesIO()
+    with tarfile.open(fileobj=archive, mode="w") as tar:
+        entry = tarfile.TarInfo("../outside.txt")
+        entry.size = 1
+        tar.addfile(entry, io.BytesIO(b"x"))
+
+    with pytest.raises(runner.RunnerUnavailable, match="unsafe path"):
+        runner._extract_artifact_archive(archive.getvalue(), str(tmp_path / "artifacts"))
+
+    assert not (tmp_path / "outside.txt").exists()

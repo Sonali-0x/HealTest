@@ -21,15 +21,20 @@ Results come from a JSONL log written by the evidence plugin
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .evidence import parse_failing_location
 
@@ -164,15 +169,21 @@ def _build_failures(raw: list[dict], artifact_dir: str) -> list[TestFailure]:
     return failures
 
 
-def _pytest_cmd(test_dir: str, use_plugin: bool) -> list[str]:
-    cmd = [sys.executable, "-m", "pytest", test_dir, "-q"]
+def _pytest_cmd(test_dir: str, use_plugin: bool, test_target: str | None = None) -> list[str]:
+    cmd = [sys.executable, "-m", "pytest", test_target or test_dir, "-q"]
     if use_plugin:
         cmd[4:4] = ["-p", PLUGIN_MODULE]
     return cmd
 
 
 def _run_local(
-    test_dir: str, app_url: str, artifact_dir: str, report_log: str, timeout_s: int, summary: RunSummary
+    test_dir: str,
+    app_url: str,
+    artifact_dir: str,
+    report_log: str,
+    timeout_s: int,
+    summary: RunSummary,
+    test_target: str | None = None,
 ) -> None:
     import importlib.util
 
@@ -189,10 +200,19 @@ def _run_local(
     env["HEALTEST_ARTIFACT_DIR"] = artifact_dir
     env["HEALTEST_REPORT_LOG"] = report_log
     if plugdir:
-        env["PYTHONPATH"] = plugdir + os.pathsep + env.get("PYTHONPATH", "")
+        backend_dir = str(Path(__file__).resolve().parent.parent)
+        env["PYTHONPATH"] = os.pathsep.join(
+            part for part in (plugdir, backend_dir, env.get("PYTHONPATH", "")) if part
+        )
     try:
         proc = subprocess.run(
-            _pytest_cmd(test_dir, use_plugin=plugdir is not None),
+            _pytest_cmd(
+                test_dir,
+                use_plugin=plugdir is not None,
+                test_target=(
+                    os.path.join(test_dir, test_target) if test_target else None
+                ),
+            ),
             env=env,
             capture_output=True,
             text=True,
@@ -211,29 +231,154 @@ def _sandbox_image() -> str:
 
 
 def _sandbox_network() -> str:
-    return os.environ.get("HEALTEST_SANDBOX_NETWORK", "healtest_default")
+    return os.environ.get("HEALTEST_SANDBOX_NETWORK", "healtest-sandbox")
+
+
+def _validate_sandbox_target(app_url: str) -> None:
+    hostname = urlparse(app_url).hostname
+    allowed_hosts = {
+        host.strip().casefold()
+        for host in os.environ.get("HEALTEST_SANDBOX_ALLOWED_HOSTS", "").split(",")
+        if host.strip()
+    }
+    if not hostname or hostname.casefold() not in allowed_hosts:
+        raise RunnerUnavailable(
+            "sandbox target host must be listed in HEALTEST_SANDBOX_ALLOWED_HOSTS"
+        )
+
+
+def _docker_run(
+    args: list[str], *, timeout_s: int | None = None, input_data: bytes | None = None
+) -> subprocess.CompletedProcess[str]:
+    try:
+        proc = subprocess.run(
+            ["docker", *args],
+            capture_output=True,
+            text=input_data is None,
+            input=input_data,
+            timeout=timeout_s,
+            check=False,
+        )
+        if input_data is not None:
+            return subprocess.CompletedProcess(
+                args,
+                proc.returncode,
+                proc.stdout.decode("utf-8", errors="replace"),
+                proc.stderr.decode("utf-8", errors="replace"),
+            )
+        return proc
+    except subprocess.TimeoutExpired:
+        raise
+    except OSError as exc:
+        raise RunnerUnavailable(f"could not execute Docker CLI: {exc}") from exc
+
+
+def _docker_run_bytes(
+    args: list[str], *, timeout_s: int | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            ["docker", *args], capture_output=True, timeout=timeout_s, check=False
+        )
+    except subprocess.TimeoutExpired:
+        raise
+    except OSError as exc:
+        raise RunnerUnavailable(f"could not execute Docker CLI: {exc}") from exc
+
+
+def _archive_test_suite(test_dir: str) -> bytes:
+    root = os.path.realpath(test_dir)
+    archive_buffer = io.BytesIO()
+    with tarfile.open(fileobj=archive_buffer, mode="w") as archive:
+        for current_dir, directories, filenames in os.walk(root, followlinks=False):
+            for name in sorted(directories):
+                path = os.path.join(current_dir, name)
+                if os.path.islink(path):
+                    raise RunnerUnavailable("test suites containing symlinks cannot be sandboxed")
+                relative = os.path.relpath(path, root).replace(os.sep, "/")
+                archive.addfile(archive.gettarinfo(path, arcname=relative))
+            for name in sorted(filenames):
+                path = os.path.join(current_dir, name)
+                if os.path.islink(path):
+                    raise RunnerUnavailable("test suites containing symlinks cannot be sandboxed")
+                if not stat.S_ISREG(os.stat(path, follow_symlinks=False).st_mode):
+                    raise RunnerUnavailable("test suites may contain regular files only")
+                relative = os.path.relpath(path, root).replace(os.sep, "/")
+                with open(path, "rb") as source:
+                    archive.addfile(archive.gettarinfo(path, arcname=relative), source)
+    return archive_buffer.getvalue()
+
+
+def _extract_artifact_archive(archive_data: bytes, artifact_dir: str) -> None:
+    root = os.path.realpath(artifact_dir)
+    os.makedirs(root, exist_ok=True)
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive_data), mode="r:") as archive:
+            for member in archive:
+                relative = os.path.normpath(member.name)
+                if relative in ("", "."):
+                    continue
+                if os.path.isabs(relative) or relative == ".." or relative.startswith(
+                    ".." + os.sep
+                ):
+                    raise RunnerUnavailable("sandbox artifact archive contains an unsafe path")
+                target = os.path.realpath(os.path.join(root, relative))
+                if os.path.commonpath((root, target)) != root:
+                    raise RunnerUnavailable("sandbox artifact archive contains an unsafe path")
+                if member.isdir():
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                if not member.isfile():
+                    raise RunnerUnavailable(
+                        "sandbox artifact archive contains a non-regular file"
+                    )
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                source = archive.extractfile(member)
+                if source is None:
+                    raise RunnerUnavailable("sandbox artifact archive contains an unreadable file")
+                with source, open(target, "wb") as destination:
+                    shutil.copyfileobj(source, destination)
+    except (tarfile.TarError, OSError) as exc:
+        raise RunnerUnavailable(f"could not unpack sandbox artifacts: {exc}") from exc
+
+
+def _docker_error(
+    action: str,
+    proc: subprocess.CompletedProcess[str] | subprocess.CompletedProcess[bytes],
+) -> RunnerUnavailable:
+    details = proc.stderr or proc.stdout or "no error details"
+    if isinstance(details, bytes):
+        details = details.decode("utf-8", errors="replace")
+    details = details.strip()[:2000]
+    return RunnerUnavailable(f"Docker {action} failed (exit {proc.returncode}): {details}")
 
 
 def _run_docker(
-    test_dir: str, app_url: str, artifact_dir: str, report_log: str, timeout_s: int, summary: RunSummary
+    test_dir: str,
+    app_url: str,
+    artifact_dir: str,
+    timeout_s: int,
+    summary: RunSummary,
+    test_target: str | None = None,
 ) -> None:
     if shutil.which("docker") is None:
         raise RunnerUnavailable("docker CLI not found for sandbox mode")
+    _validate_sandbox_target(app_url)
     cpus = os.environ.get("HEALTEST_SANDBOX_CPUS", "2")
     memory = os.environ.get("HEALTEST_SANDBOX_MEMORY", "1g")
     inner_tests = "/job/tests"
     inner_out = "/job/out"
     inner_report = f"{inner_out}/report.jsonl"
-    # NOTE: bind-mount paths must be visible to the docker daemon (host
-    # paths). Read-only root needs HOME + bytecode/cache redirects.
-    cmd = [
-        "docker", "run", "--rm",
+    container_name = f"healtest-run-{uuid.uuid4().hex}"
+    create_cmd = [
+        "create",
+        "--name", container_name,
         f"--cpus={cpus}", f"--memory={memory}", "--pids-limit=256",
-        "--read-only", "--tmpfs", "/tmp",
+        "--read-only",
+        "--tmpfs", "/tmp:rw,noexec,nosuid,size=256m",
+        "--tmpfs", "/job:rw,noexec,nosuid,size=512m",
         "--cap-drop=ALL", "--security-opt=no-new-privileges",
         f"--network={_sandbox_network()}",
-        "-v", f"{os.path.abspath(test_dir)}:{inner_tests}:ro",
-        "-v", f"{os.path.abspath(artifact_dir)}:{inner_out}:rw",
         "-e", f"APP_URL={app_url}",
         "-e", f"HEALTEST_ARTIFACT_DIR={inner_out}",
         "-e", f"HEALTEST_REPORT_LOG={inner_report}",
@@ -241,17 +386,85 @@ def _run_docker(
         "-e", "PYTHONDONTWRITEBYTECODE=1",
         "-e", "HOME=/tmp",
         _sandbox_image(),
-        "python", "-m", "pytest", inner_tests, "-q",
-        "-p", PLUGIN_MODULE, "-p", "no:cacheprovider",
+        "sleep", "infinity",
     ]
+    created = _docker_run(create_cmd)
+    if created.returncode:
+        raise _docker_error("container creation", created)
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_s)
-    except subprocess.TimeoutExpired:
-        summary.timed_out = True
-        summary.errors.append(f"sandbox exceeded wall-clock limit of {timeout_s}s")
-        return
-    if proc.returncode not in (0, 1):
-        summary.errors.append(f"sandbox exited with code {proc.returncode}: {(proc.stderr or '')[:2000]}")
+        started = _docker_run(["start", container_name])
+        if started.returncode:
+            raise _docker_error("container start", started)
+
+        prepared = _docker_run(
+            ["exec", container_name, "mkdir", "-p", inner_tests, inner_out]
+        )
+        if prepared.returncode:
+            raise _docker_error("sandbox directory setup", prepared)
+
+        archive_tests = _archive_test_suite(test_dir)
+        copied_tests = _docker_run(
+            [
+                "exec", "-i", container_name, "python", "-c",
+                "import os,sys,tarfile; "
+                f"destination={inner_tests!r}; "
+                "os.makedirs(destination, exist_ok=True); "
+                "tarfile.open(fileobj=sys.stdin.buffer, mode='r|*').extractall("
+                "destination, filter='data')",
+            ],
+            input_data=archive_tests,
+        )
+        if copied_tests.returncode:
+            raise _docker_error("test-suite copy", copied_tests)
+
+        test_command = [
+            "exec", container_name, "python", "-m", "pytest",
+            os.path.join(inner_tests, test_target).replace("\\", "/") if test_target else inner_tests,
+            "-q",
+            "-p", PLUGIN_MODULE, "-p", "no:cacheprovider",
+        ]
+        try:
+            executed = _docker_run(test_command, timeout_s=timeout_s)
+        except subprocess.TimeoutExpired:
+            summary.timed_out = True
+            killed = _docker_run(["kill", container_name])
+            if killed.returncode:
+                summary.errors.append(_docker_error("timeout cleanup", killed).args[0])
+            summary.errors.append(f"sandbox exceeded wall-clock limit of {timeout_s}s")
+            return
+        if executed.returncode not in (0, 1):
+            details = (executed.stderr or executed.stdout or "").strip()[:2000]
+            summary.errors.append(
+                f"sandbox exited with code {executed.returncode}: {details}"
+            )
+
+        archive_script = (
+            "import os, stat, sys, tarfile\n"
+            "root = os.environ['HEALTEST_ARTIFACT_DIR']\n"
+            "with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:\n"
+            "    for current, directories, filenames in os.walk(root, followlinks=False):\n"
+            "        for name in sorted(directories):\n"
+            "            path = os.path.join(current, name)\n"
+            "            if os.path.islink(path):\n"
+            "                raise SystemExit('artifact directory contains a symlink')\n"
+            "            archive.add(path, arcname=os.path.relpath(path, root), recursive=False)\n"
+            "        for name in sorted(filenames):\n"
+            "            path = os.path.join(current, name)\n"
+            "            if os.path.islink(path) or not stat.S_ISREG(os.stat(path, "
+            "follow_symlinks=False).st_mode):\n"
+            "                raise SystemExit('artifact directory contains a non-regular file')\n"
+            "            archive.add(path, arcname=os.path.relpath(path, root), recursive=False)\n"
+        )
+        artifact_archive = _docker_run_bytes(
+            ["exec", container_name, "python", "-c", archive_script]
+        )
+        if artifact_archive.returncode:
+            raise _docker_error("artifact collection", artifact_archive)
+        _extract_artifact_archive(artifact_archive.stdout, artifact_dir)
+    finally:
+        removed = _docker_run(["rm", "-f", container_name])
+        if removed.returncode:
+            summary.errors.append(_docker_error("container cleanup", removed).args[0])
 
 
 def resolve_mode() -> str:
@@ -268,12 +481,26 @@ def run_tests(
     app_url: str,
     artifact_dir: str | None = None,
     timeout_s: int | None = None,
+    test_target: str | None = None,
 ) -> RunSummary:
     """Execute a pytest suite and return a parsed summary with evidence."""
     import time
 
     if not os.path.isdir(test_dir):
         raise RunnerUnavailable(f"test directory not found: {test_dir}")
+    if test_target:
+        target_path, separator, selector = test_target.partition("::")
+        normalized_target = os.path.normpath(target_path)
+        if (
+            os.path.isabs(normalized_target)
+            or normalized_target in ("", ".")
+            or normalized_target == ".."
+            or normalized_target.startswith(".." + os.sep)
+            or not os.path.isfile(os.path.join(test_dir, normalized_target))
+            or (separator and not selector)
+        ):
+            raise RunnerUnavailable("test target must be an existing file inside the test directory")
+        test_target = normalized_target + (f"::{selector}" if separator else "")
     started = time.monotonic()
     timeout_s = timeout_s or int(os.environ.get("HEALTEST_TIMEOUT_S", "300"))
     mode = resolve_mode()
@@ -284,9 +511,13 @@ def run_tests(
     report_log = os.path.join(artifact_dir, "report.jsonl")
     try:
         if mode == "docker":
-            _run_docker(test_dir, app_url, artifact_dir, report_log, timeout_s, summary)
+            _run_docker(
+                test_dir, app_url, artifact_dir, timeout_s, summary, test_target
+            )
         else:
-            _run_local(test_dir, app_url, artifact_dir, report_log, timeout_s, summary)
+            _run_local(
+                test_dir, app_url, artifact_dir, report_log, timeout_s, summary, test_target
+            )
     finally:
         summary.duration_s = time.monotonic() - started
     total, passed, raw = parse_report_log(report_log)

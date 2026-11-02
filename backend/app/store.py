@@ -10,7 +10,10 @@ from __future__ import annotations
 import os
 import shutil
 
-SUBDIRS = ("screenshots", "doms", "logs", "masks", "patches", "consoles", "elements")
+SUBDIRS = (
+    "screenshots", "doms", "logs", "masks", "patches", "consoles",
+    "elements", "traces", "locations", "urls", "manifests", "approved",
+)
 
 _ARTIFACT_SUBDIR = {
     "screenshot": ("screenshots", "png"),
@@ -19,6 +22,10 @@ _ARTIFACT_SUBDIR = {
     "mask": ("masks", "png"),
     "console": ("consoles", "log"),
     "elements": ("elements", "json"),
+    "error_trace": ("traces", "txt"),
+    "failing_location": ("locations", "txt"),
+    "page_url": ("urls", "txt"),
+    "manifest": ("manifests", "json"),
 }
 
 
