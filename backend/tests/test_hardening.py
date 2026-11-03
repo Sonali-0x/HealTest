@@ -1,7 +1,6 @@
 from datetime import datetime, timedelta, timezone
-
 import pytest
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -59,6 +58,71 @@ def test_job_rate_limiter_returns_retry_after():
         assert limited.headers["retry-after"] == "30"
         now[0] += 31
         assert client.post("/").status_code == 200
+
+
+def test_job_rate_limiter_uses_shared_redis(monkeypatch):
+    calls = []
+
+    class FakeRedisClient:
+        def eval(self, *args):
+            calls.append(args)
+            return (1, 0)
+
+    class FakeRedis:
+        @staticmethod
+        def from_url(url, **kwargs):
+            assert url == "redis://redis.example/0"
+            assert kwargs == {"socket_connect_timeout": 2, "socket_timeout": 2}
+            return FakeRedisClient()
+
+    monkeypatch.setattr("redis.Redis.from_url", FakeRedis.from_url)
+    limiter = JobRateLimiter(
+        max_requests=2,
+        window_seconds=30,
+        redis_url="redis://redis.example/0",
+    )
+
+    limiter.check("cognito-subject")
+
+    assert len(calls) == 1
+    assert calls[0][1] == 1
+    assert calls[0][2].startswith("healtest:job-rate:")
+    assert calls[0][3:5] == (2, 30)
+
+
+def test_job_rate_limiter_fails_closed_in_production_without_redis(monkeypatch):
+    monkeypatch.setenv("HEALTEST_ENV", "production")
+    limiter = JobRateLimiter(max_requests=2, window_seconds=30)
+
+    with pytest.raises(HTTPException) as exc_info:
+        limiter.check("tenant")
+
+    assert getattr(exc_info.value, "status_code", None) == 503
+
+
+@pytest.mark.parametrize(
+    "database_url,should_start",
+    [
+        ("postgresql+psycopg://user:pass@db/healtest?sslmode=verify-full", True),
+        ("postgresql+psycopg://user:pass@db/healtest", False),
+        ("sqlite:///./data/healtest.db", False),
+    ],
+)
+def test_production_requires_postgres_tls(monkeypatch, database_url, should_start):
+    monkeypatch.setattr(main.auth, "validate_settings", lambda: None)
+    monkeypatch.setenv("HEALTEST_ENV", "production")
+    monkeypatch.setenv("DATABASE_URL", database_url)
+    monkeypatch.setenv("REDIS_URL", "rediss://redis.example/0")
+    monkeypatch.setenv("HEALTEST_MOCK_MODE", "0")
+    monkeypatch.setenv("HEALTEST_DATA_DIR", "/mnt/healtest-data")
+    monkeypatch.setenv("HEALTEST_CORS_ORIGINS", "https://healtest.example")
+    monkeypatch.setenv("HEALTEST_AUTO_MIGRATE", "0")
+
+    if should_start:
+        main._startup()
+    else:
+        with pytest.raises(RuntimeError, match="PostgreSQL|TLS"):
+            main._startup()
 
 
 def test_stale_runs_and_benchmarks_are_finalized(tmp_path, monkeypatch):

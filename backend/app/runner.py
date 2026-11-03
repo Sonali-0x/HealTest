@@ -2,16 +2,16 @@
 
 Two execution modes (``HEALTEST_SANDBOX``):
 
-- ``local`` (default when no docker CLI): run pytest in-process via
-  subprocess with a wall-clock timeout. The worker container itself is
-  the isolation boundary.
+- ``local`` (explicit opt-in only): run pytest in a subprocess with a
+  wall-clock timeout. This is for trusted development suites only; test code
+  inherits the worker's environment and filesystem access.
 - ``docker``: launch a fresh ``HEALTEST_SANDBOX_IMAGE`` container per run
   with CPU/memory/pid limits, read-only filesystem and dropped
-  capabilities (PRD section 8.3). Needs the docker socket mounted and
-  ``HEALTEST_SANDBOX_NETWORK`` set to the compose network.
+  capabilities (PRD section 8.3). Requires a TLS-authenticated remote Docker
+  daemon and a pre-created ``HEALTEST_SANDBOX_NETWORK``.
 
-``auto`` (default) picks ``docker`` when the docker CLI is available,
-else ``local``. Importing this module needs stdlib only; pytest and
+``auto`` (default) always requires Docker sandbox mode and never falls back
+to local execution. Importing this module needs stdlib only; pytest and
 Selenium are exercised in the child process / container.
 
 Results come from a JSONL log written by the evidence plugin
@@ -247,6 +247,25 @@ def _validate_sandbox_target(app_url: str) -> None:
         )
 
 
+def _validate_docker_endpoint() -> None:
+    endpoint = os.environ.get("DOCKER_HOST", "")
+    if urlparse(endpoint).scheme != "tcp":
+        raise RunnerUnavailable(
+            "docker sandbox requires a remote tcp:// Docker endpoint; "
+            "local socket and non-TLS endpoints are not allowed"
+        )
+    if os.environ.get("DOCKER_TLS_VERIFY") != "1":
+        raise RunnerUnavailable("docker sandbox requires Docker TLS verification")
+    cert_dir = os.environ.get("DOCKER_CERT_PATH", "")
+    if not cert_dir or any(
+        not os.path.isfile(os.path.join(cert_dir, name))
+        for name in ("ca.pem", "cert.pem", "key.pem")
+    ):
+        raise RunnerUnavailable(
+            "docker sandbox requires ca.pem, cert.pem, and key.pem in DOCKER_CERT_PATH"
+        )
+
+
 def _docker_run(
     args: list[str], *, timeout_s: int | None = None, input_data: bytes | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -362,8 +381,11 @@ def _run_docker(
     test_target: str | None = None,
 ) -> None:
     if shutil.which("docker") is None:
-        raise RunnerUnavailable("docker CLI not found for sandbox mode")
+        raise RunnerUnavailable(
+            "docker CLI not found; refusing to run tests without sandboxing"
+        )
     _validate_sandbox_target(app_url)
+    _validate_docker_endpoint()
     cpus = os.environ.get("HEALTEST_SANDBOX_CPUS", "2")
     memory = os.environ.get("HEALTEST_SANDBOX_MEMORY", "1g")
     inner_tests = "/job/tests"
@@ -470,7 +492,7 @@ def _run_docker(
 def resolve_mode() -> str:
     mode = os.environ.get("HEALTEST_SANDBOX", "auto").lower()
     if mode == "auto":
-        return "docker" if shutil.which("docker") else "local"
+        return "docker"
     if mode not in ("local", "docker"):
         raise RunnerUnavailable(f"unknown HEALTEST_SANDBOX mode: {mode!r}")
     return mode

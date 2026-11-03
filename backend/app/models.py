@@ -20,6 +20,7 @@ class Base(DeclarativeBase):
 class Project(Base):
     __tablename__ = "projects"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_sub: Mapped[str | None] = mapped_column(String(128), nullable=True)
     name: Mapped[str] = mapped_column(String(200))
     app_url: Mapped[str] = mapped_column(String(500))
     test_path: Mapped[str] = mapped_column(String(500))
@@ -87,6 +88,7 @@ class Patch(Base):
 class Benchmark(Base):
     __tablename__ = "benchmarks"
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    owner_sub: Mapped[str | None] = mapped_column(String(128), index=True, nullable=True)
     started_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="queued")
@@ -123,7 +125,7 @@ def get_engine(url: str | None = None):
         parent = os.path.dirname(os.path.abspath(path))
         os.makedirs(parent, exist_ok=True)
         return create_engine(url, connect_args={"check_same_thread": False})
-    return create_engine(url)
+    return create_engine(url, pool_pre_ping=True, pool_recycle=300)
 
 
 engine = get_engine()
@@ -134,6 +136,9 @@ def init_db(url: str | None = None):
     eng = get_engine(url) if url else engine
     Base.metadata.create_all(bind=eng)
     additions = {
+        "projects": {
+            "owner_sub": "VARCHAR(128)",
+        },
         "patches": {
             "approved_copy_path": "VARCHAR(1000)",
         },
@@ -144,7 +149,8 @@ def init_db(url: str | None = None):
             "flaky": "INTEGER NOT NULL DEFAULT 0",
         },
         "benchmarks": {
-            "finished_at": "DATETIME",
+            "owner_sub": "VARCHAR(128)",
+            "finished_at": "TIMESTAMP",
             "status": "VARCHAR(50) NOT NULL DEFAULT 'queued'",
             "seed": "INTEGER NOT NULL DEFAULT 42",
             "report_json": "TEXT NOT NULL DEFAULT '{}'",
@@ -167,6 +173,18 @@ def init_db(url: str | None = None):
                     connection.execute(
                         text(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
                     )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_projects_owner_sub "
+                "ON projects (owner_sub)"
+            )
+        )
+        connection.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_benchmarks_owner_sub "
+                "ON benchmarks (owner_sub)"
+            )
+        )
     return eng
 
 

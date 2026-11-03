@@ -105,9 +105,10 @@ flowchart LR
 ```
 
 In Compose, the API, Redis, worker, dashboard, and sample-app server run as
-separate services. The worker starts a fresh constrained Docker container for
-each test run. The test container is placed on an internal network for the
-target app; model calls are made by the worker, not by the test container.
+separate services. The worker delegates each test run to a fresh constrained
+container on a separately managed, isolated Docker host over mutual TLS. The
+test image, target app, and sandbox network must be available on that host;
+model calls are made by the worker, not by the test container.
 
 ### Repair states
 
@@ -134,6 +135,10 @@ From the repository root, copy the example environment file and start Compose:
 
 ```powershell
 Copy-Item .env.example .env
+# Generate a token, then set HEALTEST_API_TOKEN in .env to that value.
+py -c "import secrets; print(secrets.token_urlsafe(32))"
+# Generate a Redis password, then set REDIS_PASSWORD in .env to that value.
+py -c "import secrets; print(secrets.token_hex(32))"
 docker compose up --build -d
 ```
 
@@ -147,8 +152,50 @@ For macOS/Linux:
 
 ```sh
 cp .env.example .env
+# Generate a token, then set HEALTEST_API_TOKEN in .env to that value.
+python3 -c "import secrets; print(secrets.token_urlsafe(32))"
+# Generate a Redis password, then set REDIS_PASSWORD in .env to that value.
+python3 -c "import secrets; print(secrets.token_hex(32))"
 docker compose up --build -d
 ```
+
+The local Compose API uses a development-only shared token. Set it in
+`.env` and enter it in the dashboard's **Settings** page. Production must not
+use this mode; it requires Cognito authentication. Compose also
+requires `REDIS_PASSWORD`; it configures Redis authentication and passes the
+authenticated URL to both API and worker. Redis is not published to a host
+port. The worker additionally requires a dedicated sandbox Docker host, its
+mutual-TLS client certificates, a pre-created isolated sandbox network, an
+allowed target hostname, and a sandbox image available on that host. Do not
+point it at the Docker daemon for the machine running HealTest.
+
+For sandbox configuration, set these values in `.env`:
+
+```dotenv
+HEALTEST_SANDBOX_DOCKER_HOST=tcp://sandbox-vm.example.internal:2376
+HEALTEST_DOCKER_CERT_PATH=C:/secure/healtest-docker-certs
+HEALTEST_SANDBOX_IMAGE=registry.example.internal/healtest-worker:<pinned-tag>
+HEALTEST_SANDBOX_NETWORK=healtest-sandbox
+HEALTEST_SANDBOX_ALLOWED_HOSTS=sample-apps
+```
+
+The certificate directory must contain `ca.pem`, `cert.pem`, and `key.pem`;
+keep it outside the repository and readable only by the operator. Provision
+the Docker daemon on a dedicated VM or host, require mutual TLS, restrict
+access to the worker, and do not expose an unauthenticated Docker API. Create
+the named sandbox network on that daemon and make the target app reachable
+from it (for example, deploy the sample app there with the allowed hostname).
+Build and publish the sandbox image to a registry accessible to that daemon,
+or load it onto that daemon in advance. Use a pinned image tag or digest.
+Compose fails if the remote endpoint or required settings are unset, and the
+runner rejects local-socket or non-TLS Docker endpoints.
+
+The Compose HTTP ports bind only to `127.0.0.1`, so they are intended for
+local access and are not directly reachable from other machines. For a public
+or remote deployment, terminate HTTPS at a maintained reverse proxy or load
+balancer and keep the application ports private; do not change these bindings
+to `0.0.0.0` or expose the plain-HTTP API directly. Configure the dashboard's
+API URL to use the HTTPS public API origin in that deployment.
 
 | Service | Local URL |
 | --- | --- |
@@ -167,6 +214,57 @@ docker compose down
 
 The local SQLite database and run artifacts are stored under
 `backend/data/`. Compose mounts that directory into the API and worker.
+
+## Public deployment: Vercel frontend and AWS backend
+
+The Compose stack is for local development and is not the production
+deployment. A public deployment needs these separately provisioned resources:
+
+- **Vercel:** deploy `frontend/`. Set `NEXT_PUBLIC_API_URL` to the HTTPS API
+  origin, `NEXT_PUBLIC_COGNITO_DOMAIN` to the Cognito hosted UI domain, and
+  `NEXT_PUBLIC_COGNITO_CLIENT_ID` to a Cognito public app-client ID. These
+  values are public configuration, not secrets. Set the exact Vercel
+  production URL plus `/auth/callback` as an allowed Cognito callback, and
+  the Vercel root URL as an allowed sign-out URL. Configure Cognito for
+  authorization-code flow with PKCE and `openid email`; do not create a
+  client secret for the browser app.
+- **AWS API:** deploy FastAPI as a private ECS service behind an HTTPS ALB with
+  an ACM certificate. Configure `HEALTEST_ENV=production`,
+  `HEALTEST_AUTH_MODE=cognito`, `COGNITO_REGION`, `COGNITO_USER_POOL_ID`,
+  `COGNITO_APP_CLIENT_ID`, and `HEALTEST_CORS_ORIGINS` set only to the exact
+  HTTPS Vercel origin. API task secrets must come from Secrets Manager.
+- **Persistence and queue:** use encrypted RDS PostgreSQL with automated
+  backups and configure `DATABASE_URL` with `sslmode=verify-full` (plus the
+  trusted RDS CA certificate); production rejects PostgreSQL URLs without TLS.
+  Use an in-transit-encryption-enabled
+  ElastiCache Redis and a `rediss://` `REDIS_URL`. Mount the same encrypted,
+  backed-up EFS filesystem at `HEALTEST_DATA_DIR` on both API and worker tasks
+  so artifact files and approved copies are durable and shared. Configure
+  AWS Backup and test a restore before accepting customer data.
+- **Worker sandbox:** run the RQ worker privately and connect it over mutual
+  TLS to a separate, dedicated sandbox EC2 host. Restrict its security group
+  to the worker; provision a pre-created isolated Docker network and a
+  pinned sandbox image on that host. The worker's TLS client certificate
+  must be mounted read-only and stored as a secret. The sandbox network must
+  reach only approved test targets; model API calls remain outside it.
+- **Operations:** before deploying the API, run a one-off migration task with
+  the same database configuration: `python -m app.maintenance migrate`.
+  Production API startup refuses automatic schema migration. Run a scheduled
+  ECS task at least once per minute with
+  `python -m app.maintenance sweep-stale-jobs`. Send service logs to
+  CloudWatch and alert on unhealthy tasks, API 5xx, queue backlog, and
+  database/storage alarms. Configure RDS/EFS backups and verify recovery.
+- **Providers:** set model and SAM credentials in Secrets Manager and inject
+  them only into the worker. Set `HEALTEST_MOCK_MODE=0`; run live-provider
+  repair and benchmark acceptance in staging before production traffic.
+
+HealTest currently assigns a workspace to one Cognito user (`sub`); shared
+organization/team membership and roles are not implemented. This provides
+user-level tenant isolation, not collaborative organization accounts. Existing
+unowned local projects are not automatically assigned to a Cognito user.
+This repository does not provision AWS or Vercel resources; the service is
+not production-ready until the selected resources, domains, secrets, backups,
+and staging checks are configured and exercised.
 
 ## Try a sample run
 
@@ -196,17 +294,22 @@ The test path is interpreted **inside the worker container**. The app URL
 below uses the Compose service name so the worker can reach it.
 
 ```powershell
+$apiToken = (Select-String -Path .env -Pattern '^HEALTEST_API_TOKEN=').Line.Substring('HEALTEST_API_TOKEN='.Length)
+$headers = @{ Authorization = "Bearer $apiToken" }
+
 $project = Invoke-RestMethod `
   -Method Post `
   -Uri http://localhost:8000/projects `
   -ContentType 'application/json' `
+  -Headers $headers `
   -Body '{"name":"todo","app_url":"http://sample-apps:8901","test_path":"/sample_apps/todo/tests"}'
 
 $run = Invoke-RestMethod `
   -Method Post `
-  -Uri "http://localhost:8000/projects/$($project.id)/runs"
+  -Uri "http://localhost:8000/projects/$($project.id)/runs" `
+  -Headers $headers
 
-Invoke-RestMethod "http://localhost:8000/runs/$($run.id)"
+Invoke-RestMethod "http://localhost:8000/runs/$($run.id)" -Headers $headers
 ```
 
 ## API surface
@@ -228,15 +331,18 @@ Interactive request/response schemas are available at
 | `GET`, `POST` | `/benchmarks` | List or start a seeded benchmark |
 | `GET` | `/benchmarks/{benchmark_id}` | Read benchmark status and results |
 
-Set `HEALTEST_API_TOKEN` to enable API token authentication on protected
-routes. It is blank in `.env.example` for local development.
+Protected routes always require authentication. Local Compose uses
+`HEALTEST_AUTH_MODE=local-token`; production must use verified Cognito access
+tokens and fails startup if Cognito settings are missing. `/health` and
+`/health/ready` remain public for load-balancer probes.
 
 ## Configure model and visual APIs
 
 Copy `.env.example` to `.env` and set credentials **there**, not in source
 files or frontend code. Compose passes the environment to the API and worker.
-The dashboard's Settings page is for the browser's API URL/token; it is **not**
-where model-provider keys belong.
+In local development, the dashboard's Settings page configures that browser's
+API URL/token; it is **not** where model-provider keys belong. Cognito
+deployments use deployment-managed API settings instead of browser overrides.
 
 For live diagnosis and patch generation, set `HEALTEST_MOCK_MODE=0` and provide
 the provider-issued OpenAI-compatible chat-completions URL, model identifier,
@@ -272,15 +378,25 @@ in this workspace.
 | Variable | Purpose |
 | --- | --- |
 | `HEALTEST_MOCK_MODE` | Use deterministic offline responses (`1`) or require configured providers (`0`) |
-| `HEALTEST_API_TOKEN` | Optional API token; blank disables API auth |
+| `HEALTEST_API_TOKEN` | Local development only; never use in production |
+| `HEALTEST_AUTH_MODE` | `cognito` for production; `local-token` only for development |
+| `COGNITO_REGION` / `COGNITO_USER_POOL_ID` / `COGNITO_APP_CLIENT_ID` | Cognito access-token validation settings |
 | `HEALTEST_CORS_ORIGINS` | Allowed browser origins; defaults to local dashboard origins |
-| `DATABASE_URL` | SQLAlchemy database URL; SQLite is the Compose default |
-| `REDIS_URL` | Redis/RQ queue; without it, jobs run inline for development |
-| `HEALTEST_SANDBOX` | Runner mode: `auto`, `local`, or `docker` |
+| `DATABASE_URL` | PostgreSQL in production; SQLite is local Compose only |
+| `REDIS_PASSWORD` | Required by local Compose to authenticate API/worker Redis connections |
+| `REDIS_URL` | Shared Redis/RQ and rate-limit store; production requires TLS (`rediss://`) |
+| `HEALTEST_DATA_DIR` | Shared persistent artifact volume mounted by API and worker |
+| `HEALTEST_AUTO_MIGRATE` | Production must be `0`; run the one-off migration task first |
+| `HEALTEST_SANDBOX` | `auto` (requires Docker, never falls back), `docker`, or `local` (trusted development only) |
+| `HEALTEST_SANDBOX_DOCKER_HOST` | Isolated remote Docker endpoint used by the Compose worker |
+| `HEALTEST_DOCKER_CERT_PATH` | Host path to the remote daemon's mutual-TLS client certificates |
+| `HEALTEST_SANDBOX_IMAGE` | Image already available to the remote sandbox daemon |
+| `HEALTEST_SANDBOX_NETWORK` | Pre-created isolated network on the remote daemon |
+| `HEALTEST_SANDBOX_ALLOWED_HOSTS` | Target hostnames reachable from that network |
 | `HEALTEST_TIMEOUT_S` | Pytest wall-clock timeout |
 | `HEALTEST_MODEL_TIMEOUT_S` | Diagnosis request timeout |
 | `HEALTEST_MAX_REQUEST_BYTES` | API request-body cap (default 1 MiB) |
-| `HEALTEST_JOB_RATE_LIMIT` / `HEALTEST_JOB_RATE_WINDOW_S` | Per-process job submission limit (defaults: 10 per 60 seconds) |
+| `HEALTEST_JOB_RATE_LIMIT` / `HEALTEST_JOB_RATE_WINDOW_S` | Per-user job submission limit stored in shared Redis in production (defaults: 10 per 60 seconds) |
 | `HEALTEST_JOB_TIMEOUT_S` / `HEALTEST_STALE_JOB_GRACE_S` | RQ timeout and stale-job grace period |
 | `HEALTEST_SANDBOX_IMAGE` | Image used for fresh per-run containers |
 | `HEALTEST_SANDBOX_NETWORK` / `HEALTEST_SANDBOX_ALLOWED_HOSTS` | Docker network and allowed test target hosts |
@@ -385,17 +501,26 @@ py -3 -m pytest -q
 - Proposed diffs are restricted to test files and checked before verification.
 - Verification and approval operate on copies; HealTest does not automatically
   modify the original project tree.
-- Docker sandbox mode uses a fresh container, resource limits, and a Compose
-  internal network for the sample target. The test container does not receive
-  the Docker socket.
-- **The worker does receive the Docker socket** to create sandbox containers.
-  Treat this local Compose setup as trusted development infrastructure, not as
-  a hardened multi-tenant deployment.
-- Local inline runner mode is for development, not untrusted test suites.
+- Docker sandbox mode uses a fresh container with resource limits,
+  read-only filesystem, dropped capabilities, and a pre-created isolated
+  network. The worker connects to a separately managed Docker daemon over
+  mutual TLS; it does not mount the HealTest host's Docker socket.
+- The remote daemon still grants container-management privileges to the
+  worker. Run it on a dedicated isolated host/VM, restrict network access to
+  the worker, and do not treat mutual TLS alone as a sandbox boundary.
+- Compose publishes the dashboard, API, and sample apps on loopback only.
+  Public deployments must use a TLS-terminating reverse proxy/load balancer;
+  never expose the Compose HTTP ports directly to an untrusted network.
+- `auto` never falls back to local execution if Docker is unavailable.
+  `HEALTEST_SANDBOX=local` is an explicit trusted-development opt-in only:
+  test code runs with the worker's environment and filesystem permissions.
+  Never use local mode for untrusted projects.
 - Safety checks are conservative guards, not a security boundary or a complete
   semantic proof that assertions are preserved. Review every diff.
-- The job rate limiter is process-local; stale runs are finalized when read,
-  not by a periodic sweeper. SQLite migration support is intentionally small.
+- Production job rate limiting uses shared Redis; the in-memory limiter is for
+  local development only. Production stale-job cleanup requires scheduling
+  `python -m app.maintenance sweep-stale-jobs`. SQLite migration support is
+  intentionally small.
 
 ## Repository map
 

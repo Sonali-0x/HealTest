@@ -1,3 +1,5 @@
+import { cognitoAccessToken, cognitoConfigured } from "./cognito";
+
 export type Project = {
   id: number;
   name: string;
@@ -131,6 +133,24 @@ const API_URL_KEY = "healtest.apiUrl";
 const API_TOKEN_KEY = "healtest.apiToken";
 
 export function apiUrl(): string {
+  if (cognitoConfigured()) {
+    const configuredUrl = process.env.NEXT_PUBLIC_API_URL?.trim();
+    if (!configuredUrl) {
+      throw new Error("NEXT_PUBLIC_API_URL is required when Cognito authentication is enabled.");
+    }
+    const parsedUrl = new URL(configuredUrl);
+    if (
+      parsedUrl.protocol !== "https:" ||
+      parsedUrl.username ||
+      parsedUrl.password ||
+      parsedUrl.pathname !== "/" ||
+      parsedUrl.search ||
+      parsedUrl.hash
+    ) {
+      throw new Error("NEXT_PUBLIC_API_URL must be an HTTPS API origin without credentials or query parameters.");
+    }
+    return configuredUrl.replace(/\/+$/, "");
+  }
   if (typeof window !== "undefined") {
     const saved = window.localStorage.getItem(API_URL_KEY)?.trim();
     if (saved) return saved.replace(/\/+$/, "");
@@ -138,13 +158,15 @@ export function apiUrl(): string {
   return (process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000").replace(/\/+$/, "");
 }
 
-function headers(init?: RequestInit): Headers {
+async function headers(init?: RequestInit): Promise<Headers> {
   const headers = new Headers(init?.headers);
   if (init?.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
   if (typeof window !== "undefined") {
-    const token = window.sessionStorage.getItem(API_TOKEN_KEY);
+    const token = cognitoConfigured()
+      ? await cognitoAccessToken()
+      : window.sessionStorage.getItem(API_TOKEN_KEY);
     if (token) headers.set("Authorization", `Bearer ${token}`);
   }
   return headers;
@@ -172,7 +194,7 @@ async function responseError(response: Response, path: string): Promise<Error> {
 export async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${apiUrl()}${path}`, {
     ...init,
-    headers: headers(init),
+    headers: await headers(init),
     cache: "no-store",
   });
   if (!response.ok) throw await responseError(response, path);
@@ -181,7 +203,7 @@ export async function api<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function apiBlob(path: string): Promise<Blob> {
   const response = await fetch(`${apiUrl()}${path}`, {
-    headers: headers(),
+    headers: await headers(),
     cache: "no-store",
   });
   if (!response.ok) throw await responseError(response, path);
@@ -189,6 +211,11 @@ export async function apiBlob(path: string): Promise<Blob> {
 }
 
 export function saveApiSettings(url: string, token: string): void {
+  if (cognitoConfigured()) {
+    window.localStorage.removeItem(API_URL_KEY);
+    window.sessionStorage.removeItem(API_TOKEN_KEY);
+    return;
+  }
   if (url.trim()) window.localStorage.setItem(API_URL_KEY, url.trim().replace(/\/+$/, ""));
   else window.localStorage.removeItem(API_URL_KEY);
   if (token) window.sessionStorage.setItem(API_TOKEN_KEY, token);
@@ -199,7 +226,7 @@ export function apiSettings(): { url: string; token: string } {
   return {
     url: apiUrl(),
     token:
-      typeof window === "undefined"
+      cognitoConfigured() || typeof window === "undefined"
         ? ""
         : window.sessionStorage.getItem(API_TOKEN_KEY) ?? "",
   };
@@ -212,7 +239,7 @@ export async function watchRunEvents(
 ): Promise<void> {
   const path = `/runs/${runId}/events`;
   const response = await fetch(`${apiUrl()}${path}`, {
-    headers: headers(),
+    headers: await headers(),
     cache: "no-store",
     signal,
   });

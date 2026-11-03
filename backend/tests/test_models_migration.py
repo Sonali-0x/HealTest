@@ -10,6 +10,14 @@ def test_init_db_adds_approved_copy_path_to_existing_patch_table(tmp_path):
     with engine.begin() as connection:
         connection.execute(
             text(
+                "CREATE TABLE projects ("
+                "id INTEGER PRIMARY KEY, name VARCHAR(200) NOT NULL, "
+                "app_url VARCHAR(500) NOT NULL, test_path VARCHAR(500) NOT NULL, "
+                "retry_limit INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+            )
+        )
+        connection.execute(
+            text(
                 "CREATE TABLE patches ("
                 "id INTEGER PRIMARY KEY, test_result_id INTEGER NOT NULL, "
                 "diff TEXT NOT NULL DEFAULT '', rationale VARCHAR(1000) NOT NULL DEFAULT '', "
@@ -42,6 +50,9 @@ def test_init_db_adds_approved_copy_path_to_existing_patch_table(tmp_path):
     }
     assert "flaky" in {
         column["name"] for column in inspector.get_columns("test_results")
+    }
+    assert "owner_sub" in {
+        column["name"] for column in inspector.get_columns("projects")
     }
     migrated_engine.dispose()
 
@@ -79,6 +90,7 @@ def test_init_db_adds_benchmark_report_columns_to_existing_tables(tmp_path):
         "finished_at",
         "report_json",
         "error",
+        "owner_sub",
     } <= {column["name"] for column in inspector.get_columns("benchmarks")}
     assert {
         "arm",

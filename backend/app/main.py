@@ -7,17 +7,21 @@ import logging
 import mimetypes
 import os
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+from urllib.parse import parse_qs, urlparse
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from sqlalchemy import text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
+from redis.exceptions import RedisError
 
-from . import jobs, models, patcher, store
+from . import auth, jobs, maintenance, models, patcher, store
 from .hardening import JobRateLimiter, RequestBodyLimitMiddleware
 from .models import get_db, init_db
-from .queue import QueueUnavailable, enqueue, job_timeout_seconds
+from .queue import QueueUnavailable, enqueue
 from .schemas import BenchmarkCreate, PatchOut, ProjectCreate, ProjectOut, RunOut
 
 log = logging.getLogger("healtest.api")
@@ -55,47 +59,90 @@ app.add_middleware(
 _job_rate_limiter = JobRateLimiter(
     max_requests=_positive_setting("HEALTEST_JOB_RATE_LIMIT", 10),
     window_seconds=_positive_setting("HEALTEST_JOB_RATE_WINDOW_S", 60),
+    redis_url=os.environ.get("REDIS_URL") or None,
 )
 
 
 @app.on_event("startup")
 def _startup() -> None:
-    init_db()
+    auth.validate_settings()
+    if os.environ.get("HEALTEST_ENV", "").strip().lower() == "production":
+        database_url = os.environ.get("DATABASE_URL", "").strip()
+        if not database_url.startswith(("postgresql://", "postgresql+psycopg://")):
+            raise RuntimeError("production requires a PostgreSQL DATABASE_URL")
+        sslmode = parse_qs(urlparse(database_url).query).get("sslmode", [""])[0]
+        if sslmode not in {"require", "verify-ca", "verify-full"}:
+            raise RuntimeError("production PostgreSQL connections require TLS via sslmode")
+        if not os.environ.get("REDIS_URL", "").strip().startswith("rediss://"):
+            raise RuntimeError("production requires a TLS-protected rediss:// REDIS_URL")
+        if os.environ.get("HEALTEST_MOCK_MODE", "1").strip() != "0":
+            raise RuntimeError("HEALTEST_MOCK_MODE=0 is required in production")
+        if not os.environ.get("HEALTEST_DATA_DIR", "").strip():
+            raise RuntimeError("HEALTEST_DATA_DIR must point to persistent artifact storage")
+        origins = [
+            origin.strip()
+            for origin in os.environ.get("HEALTEST_CORS_ORIGINS", "").split(",")
+            if origin.strip()
+        ]
+        if not origins or any(
+            origin == "*" or urlparse(origin).scheme != "https"
+            for origin in origins
+        ):
+            raise RuntimeError("production CORS origins must be explicit HTTPS origins")
+        if os.environ.get("HEALTEST_AUTO_MIGRATE", "").strip() != "0":
+            raise RuntimeError(
+                "run `python -m app.maintenance migrate` before deployment "
+                "and set HEALTEST_AUTO_MIGRATE=0"
+            )
+    else:
+        init_db()
 
 
-def _auth(authorization: str | None = Header(default=None)) -> None:
-    token = os.environ.get("HEALTEST_API_TOKEN", "")
-    if not token:
-        return
-    if authorization != f"Bearer {token}":
-        raise HTTPException(status_code=401, detail="unauthorized")
+def _limit_job_submission(
+    owner_sub: str = Depends(auth.current_principal),
+) -> None:
+    _job_rate_limiter.check(owner_sub)
+
+
+def _owned_project(db: Session, project_id: int, owner_sub: str) -> models.Project:
+    project = (
+        db.query(models.Project)
+        .filter_by(id=project_id, owner_sub=owner_sub)
+        .first()
+    )
+    if project is None:
+        raise HTTPException(status_code=404, detail="project not found")
+    return project
+
+
+def _owned_run(db: Session, run_id: int, owner_sub: str) -> models.Run:
+    run = (
+        db.query(models.Run)
+        .join(models.Project, models.Run.project_id == models.Project.id)
+        .filter(models.Run.id == run_id, models.Project.owner_sub == owner_sub)
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+def _owned_patch(db: Session, patch_id: int, owner_sub: str) -> models.Patch:
+    patch = (
+        db.query(models.Patch)
+        .join(models.TestResult, models.Patch.test_result_id == models.TestResult.id)
+        .join(models.Run, models.TestResult.run_id == models.Run.id)
+        .join(models.Project, models.Run.project_id == models.Project.id)
+        .filter(models.Patch.id == patch_id, models.Project.owner_sub == owner_sub)
+        .first()
+    )
+    if patch is None:
+        raise HTTPException(status_code=404, detail="patch not found")
+    return patch
 
 
 def _expire_stale_jobs(db: Session) -> None:
-    stale_after = job_timeout_seconds() + _positive_setting(
-        "HEALTEST_STALE_JOB_GRACE_S", 60
-    )
-    cutoff = datetime.now(timezone.utc) - timedelta(seconds=stale_after)
-    message = f"job exceeded its {job_timeout_seconds()}s execution limit"
-    changed = False
-    for row in db.query(models.Run).filter(
-        models.Run.status.in_(("queued", "running")),
-        models.Run.started_at < cutoff,
-    ):
-        row.status = "error"
-        row.error = message
-        row.finished_at = datetime.now(timezone.utc)
-        changed = True
-    for row in db.query(models.Benchmark).filter(
-        models.Benchmark.status.in_(("queued", "running")),
-        models.Benchmark.started_at < cutoff,
-    ):
-        row.status = "failed"
-        row.error = message
-        row.finished_at = datetime.now(timezone.utc)
-        changed = True
-    if changed:
-        db.commit()
+    maintenance.expire_stale_jobs(db)
 
 
 @app.get("/health")
@@ -103,9 +150,32 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-@app.post("/projects", dependencies=[Depends(_auth)])
-def create_project(body: ProjectCreate, db: Session = Depends(get_db)) -> ProjectOut:
+@app.get("/health/ready")
+def readiness() -> dict[str, str]:
+    try:
+        with models.engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        redis_url = os.environ.get("REDIS_URL", "").strip()
+        if redis_url:
+            import redis
+
+            redis.Redis.from_url(redis_url, socket_connect_timeout=2).ping()
+        elif os.environ.get("HEALTEST_ENV", "").strip().lower() == "production":
+            raise RuntimeError("REDIS_URL must be configured in production")
+    except (SQLAlchemyError, RedisError, RuntimeError) as exc:
+        log.warning("Readiness check failed: %s", exc)
+        raise HTTPException(status_code=503, detail="service dependencies unavailable") from exc
+    return {"status": "ready"}
+
+
+@app.post("/projects")
+def create_project(
+    body: ProjectCreate,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> ProjectOut:
     row = models.Project(
+        owner_sub=owner_sub,
         name=body.name, app_url=body.app_url, test_path=body.test_path, retry_limit=body.retry_limit
     )
     db.add(row)
@@ -116,9 +186,12 @@ def create_project(body: ProjectCreate, db: Session = Depends(get_db)) -> Projec
     )
 
 
-@app.get("/projects", dependencies=[Depends(_auth)])
-def list_projects(db: Session = Depends(get_db)) -> list[ProjectOut]:
-    rows = db.query(models.Project).all()
+@app.get("/projects")
+def list_projects(
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> list[ProjectOut]:
+    rows = db.query(models.Project).filter_by(owner_sub=owner_sub).all()
     return [
         ProjectOut(id=r.id, name=r.name, app_url=r.app_url, test_path=r.test_path, retry_limit=r.retry_limit)
         for r in rows
@@ -135,12 +208,14 @@ def _run_out(row: models.Run) -> RunOut:
 
 @app.post(
     "/projects/{project_id}/runs",
-    dependencies=[Depends(_auth), Depends(_job_rate_limiter)],
+    dependencies=[Depends(_limit_job_submission)],
 )
-def start_run(project_id: int, db: Session = Depends(get_db)) -> RunOut:
-    project = db.get(models.Project, project_id)
-    if not project:
-        raise HTTPException(status_code=404, detail="project not found")
+def start_run(
+    project_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> RunOut:
+    project = _owned_project(db, project_id, owner_sub)
     run = models.Run(project_id=project_id, status="queued")
     db.add(run)
     db.commit()
@@ -161,18 +236,29 @@ def start_run(project_id: int, db: Session = Depends(get_db)) -> RunOut:
     return _run_out(run)
 
 
-@app.get("/runs", dependencies=[Depends(_auth)])
-def list_runs(db: Session = Depends(get_db)) -> list[RunOut]:
+@app.get("/runs")
+def list_runs(
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> list[RunOut]:
     _expire_stale_jobs(db)
-    return [_run_out(r) for r in db.query(models.Run).all()]
+    runs = (
+        db.query(models.Run)
+        .join(models.Project, models.Run.project_id == models.Project.id)
+        .filter(models.Project.owner_sub == owner_sub)
+        .all()
+    )
+    return [_run_out(run) for run in runs]
 
 
-@app.get("/runs/{run_id}", dependencies=[Depends(_auth)])
-def run_detail(run_id: int, db: Session = Depends(get_db)) -> dict:
+@app.get("/runs/{run_id}")
+def run_detail(
+    run_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> dict:
     _expire_stale_jobs(db)
-    run = db.get(models.Run, run_id)
-    if not run:
-        raise HTTPException(status_code=404, detail="run not found")
+    run = _owned_run(db, run_id, owner_sub)
     results = db.query(models.TestResult).filter_by(run_id=run_id).all()
     out = []
     for res in results:
@@ -221,18 +307,29 @@ def run_detail(run_id: int, db: Session = Depends(get_db)) -> dict:
     return {"run": run_out, "results": out}
 
 
-@app.get("/runs/{run_id}/events", dependencies=[Depends(_auth)])
-def run_events(run_id: int, db: Session = Depends(get_db)):
+@app.get("/runs/{run_id}/events")
+def run_events(
+    run_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+):
     _expire_stale_jobs(db)
-    if db.get(models.Run, run_id) is None:
-        raise HTTPException(status_code=404, detail="run not found")
+    _owned_run(db, run_id, owner_sub)
 
     def gen():
         previous: str | None = None
         for _ in range(60):
             with models.SessionLocal() as stream_db:
                 _expire_stale_jobs(stream_db)
-                run = stream_db.get(models.Run, run_id)
+                run = (
+                    stream_db.query(models.Run)
+                    .join(models.Project, models.Run.project_id == models.Project.id)
+                    .filter(
+                        models.Run.id == run_id,
+                        models.Project.owner_sub == owner_sub,
+                    )
+                    .first()
+                )
                 if run is None:
                     payload = {"run_id": run_id, "event": "error", "error": "run not found"}
                 else:
@@ -260,9 +357,24 @@ def run_events(run_id: int, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/artifacts/{artifact_id}", dependencies=[Depends(_auth)])
-def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
-    artifact = db.get(models.Artifact, artifact_id)
+@app.get("/artifacts/{artifact_id}")
+def download_artifact(
+    artifact_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+):
+    artifact = (
+        db.query(models.Artifact)
+        .join(models.Attempt, models.Artifact.attempt_id == models.Attempt.id)
+        .join(models.TestResult, models.Attempt.test_result_id == models.TestResult.id)
+        .join(models.Run, models.TestResult.run_id == models.Run.id)
+        .join(models.Project, models.Run.project_id == models.Project.id)
+        .filter(
+            models.Artifact.id == artifact_id,
+            models.Project.owner_sub == owner_sub,
+        )
+        .first()
+    )
     if artifact is None:
         raise HTTPException(status_code=404, detail="artifact not found")
     root = os.path.realpath(store.store_root())
@@ -277,16 +389,13 @@ def download_artifact(artifact_id: int, db: Session = Depends(get_db)):
     return FileResponse(path, media_type=media_type, filename=os.path.basename(path))
 
 
-def _patch_or_404(db: Session, patch_id: int) -> models.Patch:
-    patch = db.get(models.Patch, patch_id)
-    if not patch:
-        raise HTTPException(status_code=404, detail="patch not found")
-    return patch
-
-
-@app.post("/patches/{patch_id}/approve", dependencies=[Depends(_auth)])
-def approve_patch(patch_id: int, db: Session = Depends(get_db)) -> PatchOut:
-    patch = _patch_or_404(db, patch_id)
+@app.post("/patches/{patch_id}/approve")
+def approve_patch(
+    patch_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> PatchOut:
+    patch = _owned_patch(db, patch_id, owner_sub)
     if patch.status == "approved" and patch.approved_copy_path:
         if not os.path.isdir(store.resolve(patch.approved_copy_path)):
             raise HTTPException(
@@ -329,9 +438,13 @@ def approve_patch(patch_id: int, db: Session = Depends(get_db)) -> PatchOut:
     )
 
 
-@app.post("/patches/{patch_id}/reject", dependencies=[Depends(_auth)])
-def reject_patch(patch_id: int, db: Session = Depends(get_db)) -> PatchOut:
-    patch = _patch_or_404(db, patch_id)
+@app.post("/patches/{patch_id}/reject")
+def reject_patch(
+    patch_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> PatchOut:
+    patch = _owned_patch(db, patch_id, owner_sub)
     if patch.status == "rejected":
         return PatchOut(id=patch.id, test_result_id=patch.test_result_id, status=patch.status, rationale=patch.rationale)
     if patch.status != "proposed":
@@ -341,9 +454,13 @@ def reject_patch(patch_id: int, db: Session = Depends(get_db)) -> PatchOut:
     return PatchOut(id=patch.id, test_result_id=patch.test_result_id, status=patch.status, rationale=patch.rationale)
 
 
-@app.get("/patches/{patch_id}/download", dependencies=[Depends(_auth)])
-def download_patch(patch_id: int, db: Session = Depends(get_db)):
-    patch = _patch_or_404(db, patch_id)
+@app.get("/patches/{patch_id}/download")
+def download_patch(
+    patch_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+):
+    patch = _owned_patch(db, patch_id, owner_sub)
     return Response(
         content=patch.diff,
         media_type="text/plain",
@@ -351,10 +468,18 @@ def download_patch(patch_id: int, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/benchmarks", dependencies=[Depends(_auth)])
-def list_benchmarks(db: Session = Depends(get_db)) -> list[dict]:
+@app.get("/benchmarks")
+def list_benchmarks(
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> list[dict]:
     _expire_stale_jobs(db)
-    rows = db.query(models.Benchmark).order_by(models.Benchmark.id.desc()).all()
+    rows = (
+        db.query(models.Benchmark)
+        .filter_by(owner_sub=owner_sub)
+        .order_by(models.Benchmark.id.desc())
+        .all()
+    )
     return [
         {
             "id": row.id,
@@ -369,9 +494,13 @@ def list_benchmarks(db: Session = Depends(get_db)) -> list[dict]:
 
 @app.post(
     "/benchmarks",
-    dependencies=[Depends(_auth), Depends(_job_rate_limiter)],
+    dependencies=[Depends(_limit_job_submission)],
 )
-def start_benchmark(body: BenchmarkCreate, db: Session = Depends(get_db)) -> dict:
+def start_benchmark(
+    body: BenchmarkCreate,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> dict:
     allowed_apps = {"todo", "shop", "multistep-form"}
     allowed_mutations = {
         "renamed_id",
@@ -395,6 +524,7 @@ def start_benchmark(body: BenchmarkCreate, db: Session = Depends(get_db)) -> dic
         )
     config = body.model_dump()
     row = models.Benchmark(
+        owner_sub=owner_sub,
         config=json.dumps(config, sort_keys=True),
         status="queued",
         seed=body.seed,
@@ -415,10 +545,18 @@ def start_benchmark(body: BenchmarkCreate, db: Session = Depends(get_db)) -> dic
     return {"id": row.id, "status": row.status, "seed": row.seed}
 
 
-@app.get("/benchmarks/{benchmark_id}", dependencies=[Depends(_auth)])
-def benchmark_detail(benchmark_id: int, db: Session = Depends(get_db)) -> dict:
+@app.get("/benchmarks/{benchmark_id}")
+def benchmark_detail(
+    benchmark_id: int,
+    owner_sub: str = Depends(auth.current_principal),
+    db: Session = Depends(get_db),
+) -> dict:
     _expire_stale_jobs(db)
-    row = db.get(models.Benchmark, benchmark_id)
+    row = (
+        db.query(models.Benchmark)
+        .filter_by(id=benchmark_id, owner_sub=owner_sub)
+        .first()
+    )
     if not row:
         raise HTTPException(status_code=404, detail="benchmark not found")
     return {

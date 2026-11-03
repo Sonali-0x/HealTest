@@ -24,8 +24,9 @@ def test_benchmark_api_queues_run_and_returns_persisted_report(tmp_path, monkeyp
 
     queued = []
     monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main.auth, "validate_settings", lambda: None)
     monkeypatch.setattr(main, "enqueue", lambda fn, *args: queued.append((fn, args)))
-    monkeypatch.delenv("HEALTEST_API_TOKEN", raising=False)
+    main.app.dependency_overrides[main.auth.current_principal] = lambda: "tenant-a"
     main.app.dependency_overrides[get_db] = override_db
     try:
         with TestClient(main.app) as client:
@@ -68,8 +69,9 @@ def test_benchmark_api_rejects_unknown_mutation(tmp_path, monkeypatch):
             db.close()
 
     monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main.auth, "validate_settings", lambda: None)
     monkeypatch.setattr(main, "enqueue", lambda *args: None)
-    monkeypatch.delenv("HEALTEST_API_TOKEN", raising=False)
+    main.app.dependency_overrides[main.auth.current_principal] = lambda: "tenant-a"
     main.app.dependency_overrides[get_db] = override_db
     try:
         with TestClient(main.app) as client:
@@ -103,8 +105,9 @@ def test_benchmark_queue_failure_is_reported_and_persisted(tmp_path, monkeypatch
         raise QueueUnavailable("configured Redis queue is unavailable")
 
     monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main.auth, "validate_settings", lambda: None)
     monkeypatch.setattr(main, "enqueue", fail_enqueue)
-    monkeypatch.delenv("HEALTEST_API_TOKEN", raising=False)
+    main.app.dependency_overrides[main.auth.current_principal] = lambda: "tenant-a"
     main.app.dependency_overrides[get_db] = override_db
     try:
         with TestClient(main.app) as client:

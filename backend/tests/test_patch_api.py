@@ -19,6 +19,7 @@ def patch_context(tmp_path, monkeypatch):
     original = 'driver.find_element(By.ID, "submit").click()\nassert True\n'
     (test_dir / "test_form.py").write_text(original, encoding="utf-8")
     project = models.Project(
+        owner_sub="tenant-a",
         name="sample",
         app_url="http://localhost",
         test_path=str(test_dir),
@@ -46,32 +47,32 @@ def patch_context(tmp_path, monkeypatch):
 def test_approve_applies_only_to_test_copy(patch_context):
     db, _project, _result, patch, test_dir, original, patched = patch_context
 
-    response = main.approve_patch(patch.id, db)
+    response = main.approve_patch(patch.id, "tenant-a", db)
 
     assert response.status == "approved"
     copy_root = store.resolve(response.approved_copy_path)
     assert os.path.isfile(os.path.join(copy_root, "test_form.py"))
     assert open(os.path.join(copy_root, "test_form.py"), encoding="utf-8").read() == patched
     assert (test_dir / "test_form.py").read_text(encoding="utf-8") == original
-    assert main.approve_patch(patch.id, db).approved_copy_path == response.approved_copy_path
+    assert main.approve_patch(patch.id, "tenant-a", db).approved_copy_path == response.approved_copy_path
 
 
 def test_rejected_patch_cannot_be_approved(patch_context):
     db, _project, _result, patch, _test_dir, _original, _patched = patch_context
-    main.reject_patch(patch.id, db)
+    main.reject_patch(patch.id, "tenant-a", db)
 
     with pytest.raises(HTTPException) as exc_info:
-        main.approve_patch(patch.id, db)
+        main.approve_patch(patch.id, "tenant-a", db)
 
     assert exc_info.value.status_code == 409
 
 
 def test_rejecting_approved_patch_is_conflict(patch_context):
     db, _project, _result, patch, _test_dir, _original, _patched = patch_context
-    main.approve_patch(patch.id, db)
+    main.approve_patch(patch.id, "tenant-a", db)
 
     with pytest.raises(HTTPException) as exc_info:
-        main.reject_patch(patch.id, db)
+        main.reject_patch(patch.id, "tenant-a", db)
 
     assert exc_info.value.status_code == 409
 
@@ -82,7 +83,7 @@ def test_invalid_patch_does_not_create_approved_copy(patch_context, tmp_path):
     db.commit()
 
     with pytest.raises(HTTPException) as exc_info:
-        main.approve_patch(patch.id, db)
+        main.approve_patch(patch.id, "tenant-a", db)
 
     assert exc_info.value.status_code == 422
     assert patch.status == "proposed"

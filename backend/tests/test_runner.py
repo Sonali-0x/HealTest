@@ -98,6 +98,23 @@ def test_resolve_mode_explicit(monkeypatch):
         runner.resolve_mode()
 
 
+def test_auto_mode_never_falls_back_to_local(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEALTEST_SANDBOX", raising=False)
+    monkeypatch.setattr(runner.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        runner,
+        "_run_local",
+        lambda *args, **kwargs: pytest.fail("auto mode must not execute locally"),
+    )
+    suite = tmp_path / "tests"
+    suite.mkdir()
+    (suite / "test_sample.py").write_text("def test_sample(): pass\n", encoding="utf-8")
+
+    assert runner.resolve_mode() == "docker"
+    with pytest.raises(runner.RunnerUnavailable, match="refusing to run tests"):
+        runner.run_tests(str(suite), "http://sample-apps:8901")
+
+
 def test_run_tests_validates_target_is_inside_suite(tmp_path):
     suite = tmp_path / "tests"
     suite.mkdir()
@@ -142,6 +159,36 @@ def test_docker_target_requires_explicit_host_allowlist(monkeypatch):
         runner._validate_sandbox_target("http://other.example/")
 
 
+def test_docker_endpoint_requires_remote_tls(monkeypatch, tmp_path):
+    monkeypatch.setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_CERT_PATH", str(tmp_path))
+
+    with pytest.raises(runner.RunnerUnavailable, match="remote tcp"):
+        runner._validate_docker_endpoint()
+
+    monkeypatch.setenv("DOCKER_HOST", "tcp://sandbox-daemon.example:2376")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "0")
+    with pytest.raises(runner.RunnerUnavailable, match="TLS verification"):
+        runner._validate_docker_endpoint()
+
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    with pytest.raises(runner.RunnerUnavailable, match="ca.pem"):
+        runner._validate_docker_endpoint()
+
+    for name in ("ca.pem", "cert.pem", "key.pem"):
+        (tmp_path / name).write_text("test certificate material", encoding="utf-8")
+    runner._validate_docker_endpoint()
+
+
+def _configure_remote_docker(monkeypatch, cert_dir):
+    for name in ("ca.pem", "cert.pem", "key.pem"):
+        (cert_dir / name).write_text("test certificate material", encoding="utf-8")
+    monkeypatch.setenv("DOCKER_HOST", "tcp://sandbox-daemon.example:2376")
+    monkeypatch.setenv("DOCKER_TLS_VERIFY", "1")
+    monkeypatch.setenv("DOCKER_CERT_PATH", str(cert_dir))
+
+
 def test_docker_runner_uses_ephemeral_isolated_container(tmp_path, monkeypatch):
     calls = []
 
@@ -166,6 +213,9 @@ def test_docker_runner_uses_ephemeral_isolated_container(tmp_path, monkeypatch):
     monkeypatch.setenv("HEALTEST_SANDBOX_NETWORK", "healtest-sandbox")
     monkeypatch.setenv("HEALTEST_SANDBOX_CPUS", "1.5")
     monkeypatch.setenv("HEALTEST_SANDBOX_MEMORY", "768m")
+    cert_dir = tmp_path / "docker-certs"
+    cert_dir.mkdir()
+    _configure_remote_docker(monkeypatch, cert_dir)
     tests = tmp_path / "tests"
     tests.mkdir()
     (tests / "test_sample.py").write_text("def test_sample(): pass\n")
@@ -223,6 +273,9 @@ def test_docker_runner_kills_timed_out_container(tmp_path, monkeypatch):
     monkeypatch.setattr(runner.shutil, "which", lambda name: "/usr/bin/docker")
     monkeypatch.setattr(runner, "_docker_run", fake_docker_run)
     monkeypatch.setenv("HEALTEST_SANDBOX_ALLOWED_HOSTS", "sample-apps")
+    cert_dir = tmp_path / "docker-certs"
+    cert_dir.mkdir()
+    _configure_remote_docker(monkeypatch, cert_dir)
     summary = runner.RunSummary()
 
     runner._run_docker(

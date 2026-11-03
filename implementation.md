@@ -147,6 +147,24 @@ HealTest/
 
 **Implementation update (2026-11-03):** added bounded API request bodies, per-client job-submission limits, explicit Redis/RQ enqueue failures, configurable RQ timeouts, stale queued/running job finalization, and double verification that records inconsistent results as flaky rather than healed. Added migrations and API/UI reporting for flaky counts, startup/demo PowerShell scripts, a local secret scan, CI for backend/benchmark and frontend checks, architecture documentation, demo narration, and a submission checklist. Phase 7 acceptance in this workspace passed: the startup script rebuilt/restarted Compose and observed API health; the demo script submitted a run that completed in Docker sandbox mode with 10 passing tests; the local secret scan passed; the complete backend+benchmark suite passed (200 tests); frontend lint/build and Compose configuration checks passed. The sandbox mode was confirmed as `docker`, and the benchmark/mock and patch-safety acceptance are recorded above. A clean-clone startup, hosted GitHub Actions result, recorded walkthrough, live model/SAM behavior, live-provider benchmark effectiveness, and the PRD performance targets remain unverified.
 
+**Sandbox security update (2026-11-03):** removed the worker's host Docker socket mount. Docker mode now requires a TLS-verified remote Docker endpoint and client certificates; the isolated remote daemon's network, target app, and sandbox image must be provisioned by the operator. Remote-daemon deployment has not yet been acceptance-tested; Compose intentionally fails configuration until these settings are supplied.
+
+**Sandbox fallback update (2026-11-03):** `HEALTEST_SANDBOX=auto` now always requires Docker mode and never falls back to local pytest execution if Docker is unavailable. Local execution remains an explicit trusted-development-only opt-in. Added regression coverage for refusing to run locally when Docker is missing.
+
+**Public-deployment hardening update:** added Cognito access-token validation,
+subject-scoped project/run/patch/artifact/benchmark access, shared Redis job
+rate limiting, production startup checks, and explicit migration/maintenance
+commands. The Vercel frontend uses the Cognito authorization-code flow with
+PKCE, rejects non-HTTPS Cognito/API endpoints, and does not permit browser API
+URL/token overrides when Cognito is configured. Added Vercel/AWS deployment
+guidance and browser security headers. Validation in this worktree: all 219
+backend and benchmark tests pass; frontend lint and a Cognito-configured
+production build pass; Compose config
+validates when required local settings are supplied. AWS/Vercel/Cognito
+provisioning, live provider acceptance, and the remote sandbox host remain
+unverified; do not treat the repository as production-ready until those
+external resources and staging checks are complete.
+
 ## Validation Plan
 
 - Phase 0–1: `docker compose up --build`; `curl GET /health`; break 1 locator → assert 7 artifacts exist; `pytest worker/` passes.

@@ -2,8 +2,10 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { api, apiSettings, saveApiSettings } from "../../lib/api";
+import { cognitoConfigured } from "../../lib/cognito";
 
 export default function SettingsPage() {
+  const managedByDeployment = cognitoConfigured();
   const [apiBaseUrl, setApiBaseUrl] = useState("");
   const [token, setToken] = useState("");
   const [status, setStatus] = useState<"idle" | "checking" | "connected" | "error">("idle");
@@ -50,16 +52,24 @@ export default function SettingsPage() {
       <div className="settings-grid">
         <form className="form-panel" onSubmit={submit}>
           <h2>API connection</h2>
-          <p>These settings apply to this browser only.</p>
+          <p>
+            {managedByDeployment
+              ? "API access and authentication are managed by this deployment."
+              : "These settings apply to this browser only."}
+          </p>
           <div className="form-fields">
             <div className="field">
               <label htmlFor="api-url">API base URL</label>
-              <input id="api-url" type="url" required value={apiBaseUrl} onChange={(event) => { setApiBaseUrl(event.target.value); setSaved(false); }} placeholder="http://localhost:8000" />
-              <span className="field-hint">The address of the FastAPI service, without a trailing slash.</span>
+              <input id="api-url" type="url" required value={apiBaseUrl} onChange={(event) => { setApiBaseUrl(event.target.value); setSaved(false); }} placeholder="http://localhost:8000" disabled={managedByDeployment} />
+              <span className="field-hint">
+                {managedByDeployment
+                  ? "Configured by the deployment; browser overrides are disabled."
+                  : "The address of the FastAPI service, without a trailing slash."}
+              </span>
             </div>
             <div className="field">
-              <label htmlFor="api-token">Shared API token <span className="field-optional">(optional)</span></label>
-              <input id="api-token" type="password" autoComplete="new-password" value={token} onChange={(event) => { setToken(event.target.value); setSaved(false); }} placeholder="Leave blank if API authentication is disabled" />
+              <label htmlFor="api-token">{cognitoConfigured() ? "Cognito access token" : "Local development API token"}</label>
+              <input id="api-token" type="password" autoComplete="new-password" value={token} onChange={(event) => { setToken(event.target.value); setSaved(false); }} placeholder={cognitoConfigured() ? "Managed by Cognito sign-in" : "Enter the local token configured in .env"} disabled={cognitoConfigured()} />
               <span className="field-hint">Stored in this tab’s session storage and sent as a Bearer token. Never add credentials to the project repository.</span>
             </div>
           </div>
@@ -71,7 +81,11 @@ export default function SettingsPage() {
           )}
           <div className="form-actions">
             <button className="button button-secondary" type="button" onClick={() => void checkConnection()} disabled={status === "checking"}>Test connection</button>
-            <button className="button button-primary" type="submit">{saved ? "Saved ✓" : "Save settings"}</button>
+            {!managedByDeployment && (
+              <button className="button button-primary" type="submit">
+                {saved ? "Saved ✓" : "Save settings"}
+              </button>
+            )}
           </div>
         </form>
         <aside className="section-stack">
