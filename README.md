@@ -148,6 +148,20 @@ Or use the PowerShell helper, which also waits for API health:
 .\scripts\start.ps1
 ```
 
+The default Compose startup intentionally leaves the sandbox worker disabled
+until its remote mutual-TLS Docker host is configured. This is enough to open
+the dashboard and API, but queued repair and benchmark jobs will not execute
+until the worker is started. After configuring the sandbox values below, start
+it explicitly with:
+
+```powershell
+docker compose --profile sandbox-worker up --build -d worker
+```
+
+For frontend-only development, run `npm run dev` from `frontend/`, not from
+the repository root. The PowerShell startup helper detects an existing server
+on port 3000 and leaves it running while it starts the API dependencies.
+
 For macOS/Linux:
 
 ```sh

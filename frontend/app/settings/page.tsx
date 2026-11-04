@@ -21,22 +21,30 @@ export default function SettingsPage() {
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     saveApiSettings(apiBaseUrl, token.trim());
+    setToken("");
     setSaved(true);
     setStatus("idle");
     setMessage("Settings saved in this browser.");
   }
 
   async function checkConnection() {
-    saveApiSettings(apiBaseUrl, token.trim());
+    const savedToken = token.trim() || apiSettings().token;
+    saveApiSettings(apiBaseUrl, savedToken);
+    setToken("");
     setStatus("checking");
     setMessage("");
     try {
-      await api<{ status: string }>("/health");
+      await api<unknown>("/projects");
       setStatus("connected");
-      setMessage("HealTest API is reachable.");
+      setMessage("HealTest API authentication is valid.");
     } catch (reason) {
       setStatus("error");
-      setMessage(reason instanceof Error ? reason.message : "Could not connect to the API.");
+      const error = reason instanceof Error ? reason.message : "Could not connect to the API.";
+      setMessage(
+        error === "unauthorized"
+          ? "The API rejected this token. Copy HEALTEST_API_TOKEN from the repository .env file and try again."
+          : error,
+      );
     }
   }
 
@@ -70,7 +78,7 @@ export default function SettingsPage() {
             <div className="field">
               <label htmlFor="api-token">{cognitoConfigured() ? "Cognito access token" : "Local development API token"}</label>
               <input id="api-token" type="password" autoComplete="new-password" value={token} onChange={(event) => { setToken(event.target.value); setSaved(false); }} placeholder={cognitoConfigured() ? "Managed by Cognito sign-in" : "Enter the local token configured in .env"} disabled={cognitoConfigured()} />
-              <span className="field-hint">Stored in this tab’s session storage and sent as a Bearer token. Never add credentials to the project repository.</span>
+              <span className="field-hint">Stored in this browser for local development and sent as a bearer token. Never use this token in production.</span>
             </div>
           </div>
           {message && (

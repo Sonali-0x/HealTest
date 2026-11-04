@@ -28,6 +28,8 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
 
   worker:
+    profiles:
+      - sandbox-worker
     build:
       context: .
       dockerfile: ./worker/Dockerfile
@@ -41,10 +43,10 @@ services:
       REDIS_URL: "redis://:${REDIS_PASSWORD:?Set REDIS_PASSWORD in .env}@redis:6379/0"
       HEALTEST_DATA_DIR: /data
       HEALTEST_SANDBOX: docker
-      HEALTEST_SANDBOX_IMAGE: ${HEALTEST_SANDBOX_IMAGE:?Set HEALTEST_SANDBOX_IMAGE in .env}
-      HEALTEST_SANDBOX_NETWORK: ${HEALTEST_SANDBOX_NETWORK:?Set HEALTEST_SANDBOX_NETWORK in .env}
-      HEALTEST_SANDBOX_ALLOWED_HOSTS: ${HEALTEST_SANDBOX_ALLOWED_HOSTS:?Set HEALTEST_SANDBOX_ALLOWED_HOSTS in .env}
-      DOCKER_HOST: ${HEALTEST_SANDBOX_DOCKER_HOST:?Set HEALTEST_SANDBOX_DOCKER_HOST in .env}
+      HEALTEST_SANDBOX_IMAGE: ${HEALTEST_SANDBOX_IMAGE:-healtest-worker}
+      HEALTEST_SANDBOX_NETWORK: ${HEALTEST_SANDBOX_NETWORK:-healtest-sandbox}
+      HEALTEST_SANDBOX_ALLOWED_HOSTS: ${HEALTEST_SANDBOX_ALLOWED_HOSTS:-sample-apps}
+      DOCKER_HOST: ${HEALTEST_SANDBOX_DOCKER_HOST:-tcp://127.0.0.1:2376}
       DOCKER_CONTEXT: ""
       DOCKER_TLS_VERIFY: "1"
       DOCKER_CERT_PATH: /docker-certs
@@ -52,7 +54,7 @@ services:
       - ./backend/data:/data
       - ./sample_apps:/sample_apps:ro
       - type: bind
-        source: ${HEALTEST_DOCKER_CERT_PATH:?Set HEALTEST_DOCKER_CERT_PATH in .env}
+        source: ${HEALTEST_DOCKER_CERT_PATH:-./docker-certs}
         target: /docker-certs
         read_only: true
     depends_on:
