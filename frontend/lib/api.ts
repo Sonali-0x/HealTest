@@ -132,6 +132,20 @@ export type RunEvent = {
 const API_URL_KEY = "healtest.apiUrl";
 const API_TOKEN_KEY = "healtest.apiToken";
 
+function localApiToken(): string | null {
+  if (typeof window === "undefined" || cognitoConfigured()) return null;
+
+  const savedToken = window.localStorage.getItem(API_TOKEN_KEY);
+  if (savedToken) return savedToken;
+
+  const sessionToken = window.sessionStorage.getItem(API_TOKEN_KEY);
+  if (!sessionToken) return null;
+
+  window.localStorage.setItem(API_TOKEN_KEY, sessionToken);
+  window.sessionStorage.removeItem(API_TOKEN_KEY);
+  return sessionToken;
+}
+
 export function apiUrl(): string {
   if (cognitoConfigured()) {
     const configuredUrl = process.env.NEXT_PUBLIC_API_URL?.trim();
@@ -164,9 +178,7 @@ async function headers(init?: RequestInit): Promise<Headers> {
     headers.set("Content-Type", "application/json");
   }
   if (typeof window !== "undefined") {
-    const token = cognitoConfigured()
-      ? await cognitoAccessToken()
-      : window.sessionStorage.getItem(API_TOKEN_KEY);
+    const token = cognitoConfigured() ? await cognitoAccessToken() : localApiToken();
     if (token) headers.set("Authorization", `Bearer ${token}`);
   }
   return headers;
@@ -213,22 +225,21 @@ export async function apiBlob(path: string): Promise<Blob> {
 export function saveApiSettings(url: string, token: string): void {
   if (cognitoConfigured()) {
     window.localStorage.removeItem(API_URL_KEY);
+    window.localStorage.removeItem(API_TOKEN_KEY);
     window.sessionStorage.removeItem(API_TOKEN_KEY);
     return;
   }
   if (url.trim()) window.localStorage.setItem(API_URL_KEY, url.trim().replace(/\/+$/, ""));
   else window.localStorage.removeItem(API_URL_KEY);
-  if (token) window.sessionStorage.setItem(API_TOKEN_KEY, token);
-  else window.sessionStorage.removeItem(API_TOKEN_KEY);
+  if (token) window.localStorage.setItem(API_TOKEN_KEY, token);
+  else window.localStorage.removeItem(API_TOKEN_KEY);
+  window.sessionStorage.removeItem(API_TOKEN_KEY);
 }
 
 export function apiSettings(): { url: string; token: string } {
   return {
     url: apiUrl(),
-    token:
-      cognitoConfigured() || typeof window === "undefined"
-        ? ""
-        : window.sessionStorage.getItem(API_TOKEN_KEY) ?? "",
+    token: localApiToken() ?? "",
   };
 }
 
